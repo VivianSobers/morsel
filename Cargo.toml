@@ -3,4 +3,5 @@ resolver = "2"
 members = [
     "crates/morsel-core",
     "crates/morsel-plan",
+    "crates/morsel-exec",
 ]

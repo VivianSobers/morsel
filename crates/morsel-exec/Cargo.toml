@@ -1,0 +1,17 @@
+[package]
+name = "morsel-exec"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+morsel-core = { path = "../morsel-core" }
+morsel-plan = { path = "../morsel-plan" }
+parquet = { version = "60.0.0", features = ["arrow"] }
+arrow = { version = "60.0.0" }
+hashbrown = "0.16"
+ahash = "0.8"
+crossbeam-deque = "0.8"
+anyhow = "1.0"
+
+[dev-dependencies]
+tempfile = "3"
