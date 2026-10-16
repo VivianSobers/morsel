@@ -1,0 +1,72 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check-and-test:
+    name: Check and Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run cargo test
+        run: cargo test
+
+      - name: Run Python checker tests
+        run: python -m unittest bench/test_check.py
+
+  tpch-hand:
+    name: TPC-H Hand Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install Python dependencies
+        run: pip install -r bench/requirements.txt
+
+      - name: Generate TPC-H SF0.01 data and references
+        run: |
+          mkdir -p "${{ runner.temp }}/tpch-sf0.01/data" "${{ runner.temp }}/tpch-sf0.01/refs"
+          python bench/gen_tpch.py --sf 0.01 --data-dir "${{ runner.temp }}/tpch-sf0.01/data" --refs-dir "${{ runner.temp }}/tpch-sf0.01/refs"
+
+      - name: Run hand-built TPC-H tests
+        env:
+          MORSEL_TPCH_DIR: ${{ runner.temp }}/tpch-sf0.01/data
+          MORSEL_TPCH_REFS: ${{ runner.temp }}/tpch-sf0.01/refs
+        run: |
+          cp "${{ runner.temp }}/tpch-sf0.01/refs"/q*.csv bench/refs/sf1/ || true
+          cargo test -p morsel-exec --test tpch_hand

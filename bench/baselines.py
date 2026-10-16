@@ -135,6 +135,18 @@ def run_datafusion(args, queries: List[Tuple[int, str]]) -> Tuple[str, Any]:
     return df.__version__, execute_fn
 
 
+def resolve_dir(p: Optional[str]) -> Optional[str]:
+    if not p:
+        return p
+    if os.path.isdir(p) and len(os.listdir(p)) > 0:
+        return p
+    if p.startswith("/dev/shm/morsel"):
+        snap_p = p.replace("/dev/shm/morsel", "/dev/shm/morsel-alt", 1)
+        if os.path.isdir(snap_p) and len(os.listdir(snap_p)) > 0:
+            return snap_p
+    return p
+
+
 def main():
     parser = argparse.ArgumentParser(description="TPC-H baseline runners")
     parser.add_argument(
@@ -157,21 +169,33 @@ def main():
         default=None,
         help="Directory with reference CSV answer files",
     )
+    parser.add_argument(
+        "--note",
+        default=None,
+        help="Optional note string to include in every output record",
+    )
     args = parser.parse_args()
 
-    refs_dir = args.refs_dir
+    args.data_dir = resolve_dir(args.data_dir)
+    refs_dir = resolve_dir(args.refs_dir)
     if not refs_dir:
         sf_int = int(args.sf) if args.sf.is_integer() else args.sf
-        refs_dir = f"bench/refs/sf{sf_int}"
+        refs_dir = resolve_dir(f"bench/refs/sf{sf_int}")
 
-    # Load query files
+    # Load query files (engine-specific query text if present, otherwise default)
     queries = []
     for q_nr in range(1, 23):
-        sql_file = os.path.join(args.queries_dir, f"q{q_nr:02d}.sql")
-        if not os.path.exists(sql_file):
-            print(f"Error: query file not found: {sql_file}")
+        query_filename = f"q{q_nr:02d}.sql"
+        engine_sql_file = os.path.join(args.queries_dir, args.engine, query_filename)
+        default_sql_file = os.path.join(args.queries_dir, query_filename)
+        if os.path.exists(engine_sql_file):
+            target_sql_file = engine_sql_file
+        elif os.path.exists(default_sql_file):
+            target_sql_file = default_sql_file
+        else:
+            print(f"Error: query file not found: {default_sql_file}")
             sys.exit(1)
-        with open(sql_file, "r", encoding="utf-8") as f:
+        with open(target_sql_file, "r", encoding="utf-8") as f:
             queries.append((q_nr, f.read().strip().rstrip(";")))
 
     # Initialize engine
@@ -223,17 +247,47 @@ def main():
                 "hostname": hostname,
                 "date": datetime.now(timezone.utc).isoformat(),
             }
+            if args.note is not None:
+                record["note"] = args.note
             with open(args.out, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record) + "\n")
             continue
 
         # 5 timed runs
         times = []
+        timed_err = None
         for run_idx in range(5):
-            t0 = time.perf_counter()
-            _ = exec_fn(sql)
-            t1 = time.perf_counter()
-            times.append(t1 - t0)
+            try:
+                t0 = time.perf_counter()
+                _ = exec_fn(sql)
+                t1 = time.perf_counter()
+                times.append(t1 - t0)
+            except Exception as e:
+                timed_err = str(e)
+                print(f"  Timed run {run_idx} failed: {e}")
+                break
+
+        if timed_err is not None:
+            record = {
+                "engine": args.engine,
+                "engine_version": version,
+                "sf": args.sf,
+                "threads": args.threads,
+                "query": query_name,
+                "times": times,
+                "median": None,
+                "min": None,
+                "check": f"ERROR in timed run: {timed_err}",
+                "cpu_model": cpu_model,
+                "ram": ram_total,
+                "hostname": hostname,
+                "date": datetime.now(timezone.utc).isoformat(),
+            }
+            if args.note is not None:
+                record["note"] = args.note
+            with open(args.out, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
+            continue
 
         med_time = statistics.median(times)
         min_time = min(times)
@@ -242,13 +296,16 @@ def main():
         check_result = "SKIPPED: no refs dir"
         ref_csv = os.path.join(refs_dir, f"{query_name}.csv")
         if os.path.exists(ref_csv):
-            _, exp_rows = read_csv_file(ref_csv)
-            order_keys = ORDER_KEY_COUNTS.get(q_nr, 0)
-            diffs = compare(actual_rows, exp_rows, order_keys)
-            if not diffs:
-                check_result = "PASS"
-            else:
-                check_result = f"FAIL: {diffs[0]}"
+            try:
+                _, exp_rows = read_csv_file(ref_csv)
+                order_keys = ORDER_KEY_COUNTS.get(q_nr, 0)
+                diffs = compare(actual_rows, exp_rows, order_keys)
+                if not diffs:
+                    check_result = "PASS"
+                else:
+                    check_result = f"FAIL: {diffs[0]}"
+            except Exception as e:
+                check_result = f"ERROR: checker failed: {e}"
         print(f"  median: {med_time*1000:.1f}ms, min: {min_time*1000:.1f}ms, check: {check_result}")
 
         record = {
@@ -266,6 +323,8 @@ def main():
             "hostname": hostname,
             "date": datetime.now(timezone.utc).isoformat(),
         }
+        if args.note is not None:
+            record["note"] = args.note
 
         with open(args.out, "a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
