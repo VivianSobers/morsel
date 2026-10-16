@@ -58,7 +58,7 @@ def load_results(results_dir: str) -> Tuple[Dict[Tuple[str, float, str], Dict[st
 
 
 def generate_markdown(records: Dict[Tuple[str, float, str], Dict[str, Any]], metadata: Dict[str, Any]) -> str:
-    engines = ["duckdb", "polars", "datafusion"]
+    engines = ["morsel", "duckdb", "polars", "datafusion"]
     scale_factors = [1.0, 10.0]
 
     lines = []

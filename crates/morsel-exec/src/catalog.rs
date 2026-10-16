@@ -43,3 +43,7 @@ impl SchemaProvider for Catalog {
 pub fn load_parquet_dir(dir: &Path, threads: usize) -> Result<Catalog> {
     load_parquet_dir_impl(dir, threads)
 }
+
+pub fn load_parquet_dir_old(dir: &Path, threads: usize) -> Result<Catalog> {
+    crate::parquet_load::load_parquet_dir_old(dir, threads)
+}
