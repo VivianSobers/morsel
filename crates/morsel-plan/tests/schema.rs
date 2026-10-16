@@ -245,3 +245,27 @@ fn scan_picks_columns_in_order() {
     assert_eq!(schema.fields[1].name, "c0");
     assert_eq!(schema.fields[1].dtype, DataType::Int32);
 }
+
+#[test]
+fn date_add_date_rejected() {
+    let schema = Schema {
+        fields: vec![
+            Field {
+                name: "d1".to_string(),
+                dtype: DataType::Date32,
+                nullable: false,
+            },
+            Field {
+                name: "d2".to_string(),
+                dtype: DataType::Date32,
+                nullable: false,
+            },
+        ],
+    };
+    let expr = Expr::Binary {
+        op: BinOp::Add,
+        left: Box::new(Expr::Column(0)),
+        right: Box::new(Expr::Column(1)),
+    };
+    assert!(expr.data_type(&schema).is_err());
+}
