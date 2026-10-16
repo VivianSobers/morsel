@@ -1,0 +1,1 @@
+Scan(customer) -> Join(orders, Left) -> Agg(2, 3) -> Sort -> Limit(16)

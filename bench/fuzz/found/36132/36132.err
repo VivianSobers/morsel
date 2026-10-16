@@ -1,0 +1,1 @@
+Panic: user-provided comparison function does not correctly implement a total order

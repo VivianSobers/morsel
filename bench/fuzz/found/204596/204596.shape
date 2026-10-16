@@ -1,0 +1,1 @@
+Scan(lineitem) -> Project -> Agg(1, 3) -> Sort
