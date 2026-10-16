@@ -142,6 +142,9 @@ pub fn binary_op_type(op: BinOp, lt: &DataType, rt: &DataType) -> Result<DataTyp
             (DataType::Int32, DataType::Int32) => Ok(DataType::Int32),
             (DataType::Float64, _) | (_, DataType::Float64) => Ok(DataType::Float64),
             (DataType::Date32, DataType::Int32 | DataType::Int64) => Ok(DataType::Date32),
+            (DataType::Int32 | DataType::Int64, DataType::Date32) if op == BinOp::Add => {
+                Ok(DataType::Date32)
+            }
             (DataType::Date32, DataType::Date32) => Ok(DataType::Int32),
             _ => bail!("unsupported binary op {:?} on {:?} and {:?}", op, lt, rt),
         },

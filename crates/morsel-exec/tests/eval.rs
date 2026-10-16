@@ -755,3 +755,39 @@ fn compare_scalars_decimal_with_integer() {
         std::cmp::Ordering::Greater
     );
 }
+
+#[test]
+fn commutative_date_addition() {
+    let schema = Arc::new(Schema {
+        fields: vec![
+            Field {
+                name: "n".to_string(),
+                dtype: DataType::Int32,
+                nullable: false,
+            },
+            Field {
+                name: "d".to_string(),
+                dtype: DataType::Date32,
+                nullable: false,
+            },
+        ],
+    });
+    let batch = Batch::new(
+        schema,
+        vec![
+            Arc::new(Column::from_scalars(DataType::Int32, &[Scalar::Int32(10)])),
+            Arc::new(Column::from_scalars(
+                DataType::Date32,
+                &[Scalar::Date32(1000)],
+            )),
+        ],
+    );
+    let expr = Expr::Binary {
+        op: BinOp::Add,
+        left: Box::new(Expr::Column(0)),
+        right: Box::new(Expr::Column(1)),
+    };
+    let res = eval(&expr, &batch).unwrap();
+    assert_eq!(res.dtype, DataType::Date32);
+    assert_eq!(res.get(0), Scalar::Date32(1010));
+}

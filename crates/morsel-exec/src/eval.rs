@@ -839,6 +839,10 @@ fn eval_arithmetic(op: BinOp, left: &Column, right: &Column, len: usize) -> Resu
                     BinOp::Sub => Scalar::Date32(d - n as i32),
                     _ => bail!("unsupported op on Date32 and Int64"),
                 },
+                (Scalar::Int32(n), Scalar::Date32(d)) if op == BinOp::Add => Scalar::Date32(d + n),
+                (Scalar::Int64(n), Scalar::Date32(d)) if op == BinOp::Add => {
+                    Scalar::Date32(d + n as i32)
+                }
                 (Scalar::Date32(d1), Scalar::Date32(d2)) if op == BinOp::Sub => {
                     Scalar::Int32(d1 - d2)
                 }
