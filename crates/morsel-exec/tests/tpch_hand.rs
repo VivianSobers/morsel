@@ -1350,3 +1350,286 @@ fn test_tpch_q10_q12_q13() {
     let p13 = plan_q13(&catalog);
     check_query(13, &p13, &catalog);
 }
+
+pub fn plan_q14(catalog: &Catalog) -> LogicalPlan {
+    let lineitem_schema = catalog.table_schema("lineitem").unwrap();
+    let part_schema = catalog.table_schema("part").unwrap();
+
+    let idx_p_partkey = part_schema.index_of("p_partkey").unwrap();
+    let idx_p_type = part_schema.index_of("p_type").unwrap();
+
+    let idx_l_partkey = lineitem_schema.index_of("l_partkey").unwrap();
+    let idx_l_extendedprice = lineitem_schema.index_of("l_extendedprice").unwrap();
+    let idx_l_discount = lineitem_schema.index_of("l_discount").unwrap();
+    let idx_l_shipdate = lineitem_schema.index_of("l_shipdate").unwrap();
+
+    let part_scan = LogicalPlan::Scan {
+        table: "part".to_string(),
+        columns: vec![idx_p_partkey, idx_p_type],
+        table_schema: part_schema,
+    };
+
+    let lineitem_scan = LogicalPlan::Scan {
+        table: "lineitem".to_string(),
+        columns: vec![
+            idx_l_partkey,
+            idx_l_extendedprice,
+            idx_l_discount,
+            idx_l_shipdate,
+        ],
+        table_schema: lineitem_schema,
+    };
+    let lineitem_filter = LogicalPlan::Filter {
+        input: Box::new(lineitem_scan),
+        predicate: Expr::Binary {
+            op: BinOp::And,
+            left: Box::new(Expr::Binary {
+                op: BinOp::GtEq,
+                left: Box::new(Expr::Column(3)),
+                right: Box::new(Expr::Literal(Scalar::Date32(date_to_days("1995-09-01")))),
+            }),
+            right: Box::new(Expr::Binary {
+                op: BinOp::Lt,
+                left: Box::new(Expr::Column(3)),
+                right: Box::new(Expr::Literal(Scalar::Date32(date_to_days("1995-10-01")))),
+            }),
+        },
+    };
+    let disc_price = Expr::Binary {
+        op: BinOp::Mul,
+        left: Box::new(Expr::Column(1)),
+        right: Box::new(Expr::Binary {
+            op: BinOp::Sub,
+            left: Box::new(Expr::Literal(Scalar::Int32(1))),
+            right: Box::new(Expr::Column(2)),
+        }),
+    };
+    let lineitem_project = LogicalPlan::Project {
+        input: Box::new(lineitem_filter),
+        exprs: vec![
+            (Expr::Column(0), "l_partkey".to_string()),
+            (disc_price, "disc_price".to_string()),
+        ],
+    };
+
+    let join = LogicalPlan::Join {
+        left: Box::new(lineitem_project),
+        right: Box::new(part_scan),
+        join_type: JoinType::Inner,
+        on: vec![(Expr::Column(0), Expr::Column(0))],
+        filter: None,
+    };
+
+    let promo_case = Expr::Case {
+        whens: vec![(
+            Expr::Like {
+                expr: Box::new(Expr::Column(3)),
+                pattern: "PROMO%".to_string(),
+                negated: false,
+            },
+            Expr::Column(1),
+        )],
+        else_expr: Some(Box::new(Expr::Literal(Scalar::Decimal(0, 4)))),
+    };
+
+    let project_cases = LogicalPlan::Project {
+        input: Box::new(join),
+        exprs: vec![
+            (promo_case, "promo_disc_price".to_string()),
+            (Expr::Column(1), "disc_price".to_string()),
+        ],
+    };
+
+    let agg = LogicalPlan::Aggregate {
+        input: Box::new(project_cases),
+        group_by: vec![],
+        aggs: vec![
+            (
+                AggExpr {
+                    func: AggFunc::Sum,
+                    arg: Some(Expr::Column(0)),
+                },
+                "promo_sum".to_string(),
+            ),
+            (
+                AggExpr {
+                    func: AggFunc::Sum,
+                    arg: Some(Expr::Column(1)),
+                },
+                "total_sum".to_string(),
+            ),
+        ],
+    };
+
+    let promo_revenue = Expr::Binary {
+        op: BinOp::Div,
+        left: Box::new(Expr::Binary {
+            op: BinOp::Mul,
+            left: Box::new(Expr::Literal(Scalar::Float64(100.0))),
+            right: Box::new(Expr::Column(0)),
+        }),
+        right: Box::new(Expr::Column(1)),
+    };
+
+    LogicalPlan::Project {
+        input: Box::new(agg),
+        exprs: vec![(promo_revenue, "promo_revenue".to_string())],
+    }
+}
+
+pub fn plan_q18(catalog: &Catalog) -> LogicalPlan {
+    let cust_schema = catalog.table_schema("customer").unwrap();
+    let orders_schema = catalog.table_schema("orders").unwrap();
+    let lineitem_schema = catalog.table_schema("lineitem").unwrap();
+
+    let idx_c_custkey = cust_schema.index_of("c_custkey").unwrap();
+    let idx_c_name = cust_schema.index_of("c_name").unwrap();
+
+    let idx_o_orderkey = orders_schema.index_of("o_orderkey").unwrap();
+    let idx_o_custkey = orders_schema.index_of("o_custkey").unwrap();
+    let idx_o_orderdate = orders_schema.index_of("o_orderdate").unwrap();
+    let idx_o_totalprice = orders_schema.index_of("o_totalprice").unwrap();
+
+    let idx_l_orderkey = lineitem_schema.index_of("l_orderkey").unwrap();
+    let idx_l_quantity = lineitem_schema.index_of("l_quantity").unwrap();
+
+    let sub_lineitem_scan = LogicalPlan::Scan {
+        table: "lineitem".to_string(),
+        columns: vec![idx_l_orderkey, idx_l_quantity],
+        table_schema: lineitem_schema.clone(),
+    };
+    let sub_agg = LogicalPlan::Aggregate {
+        input: Box::new(sub_lineitem_scan),
+        group_by: vec![(Expr::Column(0), "l_orderkey".to_string())],
+        aggs: vec![(
+            AggExpr {
+                func: AggFunc::Sum,
+                arg: Some(Expr::Column(1)),
+            },
+            "sum_qty".to_string(),
+        )],
+    };
+    let sub_filter = LogicalPlan::Filter {
+        input: Box::new(sub_agg),
+        predicate: Expr::Binary {
+            op: BinOp::Gt,
+            left: Box::new(Expr::Column(1)),
+            right: Box::new(Expr::Literal(Scalar::Decimal(30000, 2))),
+        },
+    };
+    let big_orders = LogicalPlan::Project {
+        input: Box::new(sub_filter),
+        exprs: vec![(Expr::Column(0), "l_orderkey".to_string())],
+    };
+
+    let orders_scan = LogicalPlan::Scan {
+        table: "orders".to_string(),
+        columns: vec![
+            idx_o_orderkey,
+            idx_o_custkey,
+            idx_o_orderdate,
+            idx_o_totalprice,
+        ],
+        table_schema: orders_schema,
+    };
+    let orders_semi = LogicalPlan::Join {
+        left: Box::new(orders_scan),
+        right: Box::new(big_orders),
+        join_type: JoinType::Semi,
+        on: vec![(Expr::Column(0), Expr::Column(0))],
+        filter: None,
+    };
+
+    let cust_scan = LogicalPlan::Scan {
+        table: "customer".to_string(),
+        columns: vec![idx_c_custkey, idx_c_name],
+        table_schema: cust_schema,
+    };
+    let orders_cust_join = LogicalPlan::Join {
+        left: Box::new(orders_semi),
+        right: Box::new(cust_scan),
+        join_type: JoinType::Inner,
+        on: vec![(Expr::Column(1), Expr::Column(0))],
+        filter: None,
+    };
+    let cust_orders = LogicalPlan::Project {
+        input: Box::new(orders_cust_join),
+        exprs: vec![
+            (Expr::Column(5), "c_name".to_string()),
+            (Expr::Column(4), "c_custkey".to_string()),
+            (Expr::Column(0), "o_orderkey".to_string()),
+            (Expr::Column(2), "o_orderdate".to_string()),
+            (Expr::Column(3), "o_totalprice".to_string()),
+        ],
+    };
+
+    let lineitem_scan = LogicalPlan::Scan {
+        table: "lineitem".to_string(),
+        columns: vec![idx_l_orderkey, idx_l_quantity],
+        table_schema: lineitem_schema,
+    };
+    let line_cust_orders_join = LogicalPlan::Join {
+        left: Box::new(lineitem_scan),
+        right: Box::new(cust_orders),
+        join_type: JoinType::Inner,
+        on: vec![(Expr::Column(0), Expr::Column(2))],
+        filter: None,
+    };
+
+    let agg = LogicalPlan::Aggregate {
+        input: Box::new(line_cust_orders_join),
+        group_by: vec![
+            (Expr::Column(2), "c_name".to_string()),
+            (Expr::Column(3), "c_custkey".to_string()),
+            (Expr::Column(4), "o_orderkey".to_string()),
+            (Expr::Column(5), "o_orderdate".to_string()),
+            (Expr::Column(6), "o_totalprice".to_string()),
+        ],
+        aggs: vec![(
+            AggExpr {
+                func: AggFunc::Sum,
+                arg: Some(Expr::Column(1)),
+            },
+            "sum(l_quantity)".to_string(),
+        )],
+    };
+
+    let sort = LogicalPlan::Sort {
+        input: Box::new(agg),
+        keys: vec![
+            SortKey {
+                expr: Expr::Column(4),
+                asc: false,
+                nulls_first: false,
+            },
+            SortKey {
+                expr: Expr::Column(3),
+                asc: true,
+                nulls_first: false,
+            },
+        ],
+    };
+
+    LogicalPlan::Limit {
+        input: Box::new(sort),
+        n: 100,
+    }
+}
+
+#[test]
+fn test_tpch_q14_and_q18() {
+    let tpch_dir = match std::env::var("MORSEL_TPCH_DIR") {
+        Ok(d) => PathBuf::from(d),
+        Err(_) => {
+            eprintln!("MORSEL_TPCH_DIR is not set; skipping tpch_hand test");
+            return;
+        }
+    };
+    let catalog = load_parquet_dir(&tpch_dir, 16).expect("load parquet dir");
+
+    let p14 = plan_q14(&catalog);
+    check_query(14, &p14, &catalog);
+
+    let p18 = plan_q18(&catalog);
+    check_query(18, &p18, &catalog);
+}
