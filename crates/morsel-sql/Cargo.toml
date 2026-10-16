@@ -1,0 +1,11 @@
+[package]
+name = "morsel-sql"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+morsel-core = { path = "../morsel-core" }
+morsel-plan = { path = "../morsel-plan" }
+sqlparser = "0.54"
+anyhow = "1.0"
+chrono = "0.4"
