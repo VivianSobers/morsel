@@ -669,3 +669,79 @@ fn test_or_factoring_q19_plan_level() {
         "optimized Q19 plan must have inner join with join keys"
     );
 }
+
+#[test]
+fn test_q5_join_order_avoids_customer_supplier_nationkey_cross() {
+    let catalog = tpch_schemas();
+    let stats = tpch_stats();
+    let root = repo_root();
+
+    let sql_path = root.join("queries/tpch/q05.sql");
+    let sql = fs::read_to_string(&sql_path).unwrap();
+    let plan = plan_sql(&sql, &catalog).unwrap();
+    let optimized = optimize(plan, &stats).unwrap();
+
+    fn plan_tables(p: &LogicalPlan) -> Vec<String> {
+        let mut tbls = Vec::new();
+        match p {
+            LogicalPlan::Scan { table, .. } => tbls.push(table.to_lowercase()),
+            LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Project { input, .. }
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. } => tbls.extend(plan_tables(input)),
+            LogicalPlan::Join { left, right, .. } | LogicalPlan::CrossJoin { left, right } => {
+                tbls.extend(plan_tables(left));
+                tbls.extend(plan_tables(right));
+            }
+        }
+        tbls
+    }
+
+    fn check_joins(plan: &LogicalPlan) {
+        match plan {
+            LogicalPlan::Join {
+                left, right, on, ..
+            } => {
+                let left_tables = plan_tables(left);
+                let right_tables = plan_tables(right);
+
+                // Ensure customer and supplier are never joined directly without orders present
+                if (left_tables.contains(&"customer".to_string())
+                    && !left_tables.contains(&"orders".to_string())
+                    && right_tables.contains(&"supplier".to_string())
+                    && !right_tables.contains(&"orders".to_string()))
+                    || (right_tables.contains(&"customer".to_string())
+                        && !right_tables.contains(&"orders".to_string())
+                        && left_tables.contains(&"supplier".to_string())
+                        && !left_tables.contains(&"orders".to_string()))
+                {
+                    panic!(
+                        "Customer and supplier joined directly without orders: on={:?}",
+                        on
+                    );
+                }
+
+                if right_tables == vec!["customer".to_string()] {
+                    assert!(
+                        on.len() >= 2,
+                        "Customer should join with orders (custkey) AND supplier (nationkey), but got {} on-keys: {:?}",
+                        on.len(),
+                        on
+                    );
+                }
+
+                check_joins(left);
+                check_joins(right);
+            }
+            LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Project { input, .. }
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. } => check_joins(input),
+            _ => {}
+        }
+    }
+
+    check_joins(&optimized);
+}
