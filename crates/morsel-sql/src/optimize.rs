@@ -27,7 +27,7 @@ pub fn optimize(plan: LogicalPlan, stats: &HashMap<String, usize>) -> Result<Log
     check_optimizer_step("order_joins", &plan, &root_schema)?;
 
     // 5. Push semi/anti joins below joins
-    let plan = push_semi_joins(plan)?;
+    let plan = push_semi_joins(plan, stats)?;
     check_optimizer_step("push_semi_joins", &plan, &root_schema)?;
 
     // 6. Projection pruning
@@ -2133,18 +2133,18 @@ pub fn swap_inner_joins_to_build_smaller(
 // 5. Push Semi Joins Below Joins
 // ============================================================================
 
-pub fn push_semi_joins(plan: LogicalPlan) -> Result<LogicalPlan> {
+pub fn push_semi_joins(plan: LogicalPlan, stats: &HashMap<String, usize>) -> Result<LogicalPlan> {
     match plan {
         LogicalPlan::Scan { .. } => Ok(plan),
         LogicalPlan::Filter { input, predicate } => {
-            let opt_input = push_semi_joins(*input)?;
+            let opt_input = push_semi_joins(*input, stats)?;
             Ok(LogicalPlan::Filter {
                 input: Box::new(opt_input),
                 predicate,
             })
         }
         LogicalPlan::Project { input, exprs } => {
-            let opt_input = push_semi_joins(*input)?;
+            let opt_input = push_semi_joins(*input, stats)?;
             Ok(LogicalPlan::Project {
                 input: Box::new(opt_input),
                 exprs,
@@ -2155,7 +2155,7 @@ pub fn push_semi_joins(plan: LogicalPlan) -> Result<LogicalPlan> {
             group_by,
             aggs,
         } => {
-            let opt_input = push_semi_joins(*input)?;
+            let opt_input = push_semi_joins(*input, stats)?;
             Ok(LogicalPlan::Aggregate {
                 input: Box::new(opt_input),
                 group_by,
@@ -2163,22 +2163,22 @@ pub fn push_semi_joins(plan: LogicalPlan) -> Result<LogicalPlan> {
             })
         }
         LogicalPlan::Sort { input, keys } => {
-            let opt_input = push_semi_joins(*input)?;
+            let opt_input = push_semi_joins(*input, stats)?;
             Ok(LogicalPlan::Sort {
                 input: Box::new(opt_input),
                 keys,
             })
         }
         LogicalPlan::Limit { input, n } => {
-            let opt_input = push_semi_joins(*input)?;
+            let opt_input = push_semi_joins(*input, stats)?;
             Ok(LogicalPlan::Limit {
                 input: Box::new(opt_input),
                 n,
             })
         }
         LogicalPlan::CrossJoin { left, right } => {
-            let opt_left = push_semi_joins(*left)?;
-            let opt_right = push_semi_joins(*right)?;
+            let opt_left = push_semi_joins(*left, stats)?;
+            let opt_right = push_semi_joins(*right, stats)?;
             Ok(LogicalPlan::CrossJoin {
                 left: Box::new(opt_left),
                 right: Box::new(opt_right),
@@ -2191,9 +2191,19 @@ pub fn push_semi_joins(plan: LogicalPlan) -> Result<LogicalPlan> {
             on,
             filter,
         } => {
-            let opt_left = push_semi_joins(*left)?;
-            let opt_right = push_semi_joins(*right)?;
-            push_semi_down(opt_left, opt_right, jt, on, filter)
+            let opt_left = push_semi_joins(*left, stats)?;
+            let opt_right = push_semi_joins(*right, stats)?;
+            if can_push_semi(&opt_left, &opt_right, &on, filter.as_ref(), stats) {
+                push_semi_down(opt_left, opt_right, jt, on, filter, stats)
+            } else {
+                Ok(LogicalPlan::Join {
+                    left: Box::new(opt_left),
+                    right: Box::new(opt_right),
+                    join_type: jt,
+                    on,
+                    filter,
+                })
+            }
         }
         LogicalPlan::Join {
             left,
@@ -2202,8 +2212,8 @@ pub fn push_semi_joins(plan: LogicalPlan) -> Result<LogicalPlan> {
             on,
             filter,
         } => {
-            let opt_left = push_semi_joins(*left)?;
-            let opt_right = push_semi_joins(*right)?;
+            let opt_left = push_semi_joins(*left, stats)?;
+            let opt_right = push_semi_joins(*right, stats)?;
             Ok(LogicalPlan::Join {
                 left: Box::new(opt_left),
                 right: Box::new(opt_right),
@@ -2215,12 +2225,131 @@ pub fn push_semi_joins(plan: LogicalPlan) -> Result<LogicalPlan> {
     }
 }
 
+fn plan_has_filter(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Filter { .. } => true,
+        LogicalPlan::Join {
+            filter: Some(_), ..
+        } => true,
+        LogicalPlan::Join { left, right, .. } | LogicalPlan::CrossJoin { left, right } => {
+            plan_has_filter(left) || plan_has_filter(right)
+        }
+        LogicalPlan::Project { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Limit { input, .. } => plan_has_filter(input),
+        LogicalPlan::Scan { .. } => false,
+    }
+}
+
+fn should_push_semi_below_inner(
+    target: &LogicalPlan,
+    other: &LogicalPlan,
+    build: &LogicalPlan,
+    stats: &HashMap<String, usize>,
+) -> bool {
+    let build_est = estimate_rows(build, stats);
+    let target_est = estimate_rows(target, stats);
+
+    // If the semi join build side is estimated much smaller than the target side,
+    // pushing it down filters the target early (e.g. Q18: having sum > 300 produces ~57 rows).
+    let build_much_smaller = build_est <= target_est * 0.1;
+
+    // A join filters target if the other side has filters (like nation = 'SAUDI ARABIA', orders = 'F').
+    let other_has_filter = plan_has_filter(other);
+
+    if build_much_smaller {
+        true
+    } else {
+        !other_has_filter
+    }
+}
+
+fn can_push_semi(
+    left: &LogicalPlan,
+    right: &LogicalPlan,
+    on: &[(Expr, Expr)],
+    filter: Option<&Expr>,
+    stats: &HashMap<String, usize>,
+) -> bool {
+    match left {
+        LogicalPlan::Project { input, exprs } => {
+            let proj_len = exprs.len();
+            let input_len = match input.schema() {
+                Ok(s) => s.len(),
+                Err(_) => return false,
+            };
+            let new_on: Vec<(Expr, Expr)> = on
+                .iter()
+                .map(|(l, r)| (substitute_project(l.clone(), exprs), r.clone()))
+                .collect();
+            let new_filter = filter
+                .cloned()
+                .map(|f| remap_filter_project(f, exprs, proj_len, input_len));
+            can_push_semi(input, right, &new_on, new_filter.as_ref(), stats)
+        }
+        LogicalPlan::Filter { input, .. } => match input.as_ref() {
+            LogicalPlan::Join { .. } | LogicalPlan::Project { .. } => {
+                can_push_semi(input, right, on, filter, stats)
+            }
+            _ => false,
+        },
+        LogicalPlan::Join {
+            left: inner_left,
+            join_type: JoinType::Semi | JoinType::Anti,
+            ..
+        } => can_push_semi(inner_left, right, on, filter, stats),
+        LogicalPlan::Join {
+            left: inner_left,
+            right: inner_right,
+            join_type: JoinType::Inner,
+            ..
+        } => {
+            let left_len = match inner_left.schema() {
+                Ok(s) => s.len(),
+                Err(_) => return false,
+            };
+            let right_len = match inner_right.schema() {
+                Ok(s) => s.len(),
+                Err(_) => return false,
+            };
+
+            let mut left_cols = HashSet::new();
+            for (l, _) in on {
+                expr_references_columns(l, &mut left_cols);
+            }
+            if let Some(f) = filter {
+                let mut f_cols = HashSet::new();
+                expr_references_columns(f, &mut f_cols);
+                for c in f_cols {
+                    if c < left_len + right_len {
+                        left_cols.insert(c);
+                    }
+                }
+            }
+
+            let all_in_left = !left_cols.is_empty() && left_cols.iter().all(|&c| c < left_len);
+            let all_in_right = !left_cols.is_empty() && left_cols.iter().all(|&c| c >= left_len);
+
+            if all_in_left {
+                should_push_semi_below_inner(inner_left, inner_right, right, stats)
+            } else if all_in_right {
+                should_push_semi_below_inner(inner_right, inner_left, right, stats)
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
 fn push_semi_down(
     left: LogicalPlan,
     right: LogicalPlan,
     join_type: JoinType,
     on: Vec<(Expr, Expr)>,
     filter: Option<Expr>,
+    stats: &HashMap<String, usize>,
 ) -> Result<LogicalPlan> {
     match left {
         LogicalPlan::Project { input, exprs } => {
@@ -2231,7 +2360,7 @@ fn push_semi_down(
                 .map(|(l, r)| (substitute_project(l, &exprs), r))
                 .collect();
             let new_filter = filter.map(|f| remap_filter_project(f, &exprs, proj_len, input_len));
-            let pushed = push_semi_down(*input, right, join_type, new_on, new_filter)?;
+            let pushed = push_semi_down(*input, right, join_type, new_on, new_filter, stats)?;
             Ok(LogicalPlan::Project {
                 input: Box::new(pushed),
                 exprs,
@@ -2239,7 +2368,7 @@ fn push_semi_down(
         }
         LogicalPlan::Filter { input, predicate } => match input.as_ref() {
             LogicalPlan::Join { .. } | LogicalPlan::Project { .. } => {
-                let pushed = push_semi_down(*input, right, join_type, on, filter)?;
+                let pushed = push_semi_down(*input, right, join_type, on, filter, stats)?;
                 Ok(LogicalPlan::Filter {
                     input: Box::new(pushed),
                     predicate,
@@ -2260,7 +2389,7 @@ fn push_semi_down(
             on: inner_on,
             filter: inner_filter,
         } => {
-            let pushed = push_semi_down(*inner_left, right, join_type, on, filter)?;
+            let pushed = push_semi_down(*inner_left, right, join_type, on, filter, stats)?;
             Ok(LogicalPlan::Join {
                 left: Box::new(pushed),
                 right: inner_right,
@@ -2296,7 +2425,8 @@ fn push_semi_down(
             let all_in_left = !left_cols.is_empty() && left_cols.iter().all(|&c| c < left_len);
             let all_in_right = !left_cols.is_empty() && left_cols.iter().all(|&c| c >= left_len);
 
-            if all_in_left {
+            if all_in_left && should_push_semi_below_inner(&inner_left, &inner_right, &right, stats)
+            {
                 let new_filter = filter.map(|f| {
                     remap_expr_indices(f, &|idx| {
                         if idx < left_len {
@@ -2306,7 +2436,8 @@ fn push_semi_down(
                         }
                     })
                 });
-                let pushed_left = push_semi_down(*inner_left, right, join_type, on, new_filter)?;
+                let pushed_left =
+                    push_semi_down(*inner_left, right, join_type, on, new_filter, stats)?;
                 Ok(LogicalPlan::Join {
                     left: Box::new(pushed_left),
                     right: inner_right,
@@ -2314,14 +2445,16 @@ fn push_semi_down(
                     on: inner_on,
                     filter: inner_filter,
                 })
-            } else if all_in_right {
+            } else if all_in_right
+                && should_push_semi_below_inner(&inner_right, &inner_left, &right, stats)
+            {
                 let new_on = on
                     .into_iter()
                     .map(|(l, r)| (remap_expr_columns(l, -(left_len as i64)), r))
                     .collect();
                 let new_filter = filter.map(|f| remap_expr_columns(f, -(left_len as i64)));
                 let pushed_right =
-                    push_semi_down(*inner_right, right, join_type, new_on, new_filter)?;
+                    push_semi_down(*inner_right, right, join_type, new_on, new_filter, stats)?;
                 Ok(LogicalPlan::Join {
                     left: inner_left,
                     right: Box::new(pushed_right),

@@ -619,7 +619,7 @@ fn test_optimizer_steps_preserve_schema_and_column_ranges() {
         morsel_sql::optimize::check_optimizer_step("order_joins", &ordered, &raw_schema).unwrap();
 
         // 5. Push semi joins
-        let semi_pushed = morsel_sql::optimize::push_semi_joins(ordered).unwrap();
+        let semi_pushed = morsel_sql::optimize::push_semi_joins(ordered, &stats).unwrap();
         morsel_sql::optimize::check_optimizer_step("push_semi_joins", &semi_pushed, &raw_schema)
             .unwrap();
 
@@ -912,48 +912,72 @@ fn test_push_semi_joins_below_joins_q18_and_q21() {
         "Q18 semi join must be pushed directly down to orders"
     );
 
-    // Q21: Semi and Anti joins must be pushed directly to lineitem
+    // Q21: Semi and Anti joins must keep the original form (not pushed down to lineitem)
     let sql_q21 = fs::read_to_string(root.join("queries/tpch/q21.sql")).unwrap();
     let plan_q21 = plan_sql(&sql_q21, &catalog).unwrap();
     let opt_q21 = optimize(plan_q21, &stats).unwrap();
 
-    fn verify_q21_semi_anti_on_lineitem(plan: &LogicalPlan) -> bool {
+    fn any_semi_anti_directly_on_lineitem(plan: &LogicalPlan) -> bool {
         match plan {
             LogicalPlan::Join {
                 left,
                 join_type: JoinType::Semi | JoinType::Anti,
                 ..
             } => {
-                fn is_lineitem_target(p: &LogicalPlan) -> bool {
+                fn is_scan_or_filtered_lineitem(p: &LogicalPlan) -> bool {
                     match p {
                         LogicalPlan::Scan { table, .. } => table.eq_ignore_ascii_case("lineitem"),
                         LogicalPlan::Filter { input, .. } | LogicalPlan::Project { input, .. } => {
-                            is_lineitem_target(input)
+                            is_scan_or_filtered_lineitem(input)
                         }
-                        LogicalPlan::Join {
-                            left,
-                            join_type: JoinType::Semi | JoinType::Anti,
-                            ..
-                        } => is_lineitem_target(left),
                         _ => false,
                     }
                 }
-                is_lineitem_target(left)
+                is_scan_or_filtered_lineitem(left)
             }
             LogicalPlan::Filter { input, .. }
             | LogicalPlan::Project { input, .. }
             | LogicalPlan::Aggregate { input, .. }
             | LogicalPlan::Sort { input, .. }
-            | LogicalPlan::Limit { input, .. } => verify_q21_semi_anti_on_lineitem(input),
+            | LogicalPlan::Limit { input, .. } => any_semi_anti_directly_on_lineitem(input),
             LogicalPlan::Join { left, right, .. } | LogicalPlan::CrossJoin { left, right } => {
-                verify_q21_semi_anti_on_lineitem(left) || verify_q21_semi_anti_on_lineitem(right)
+                any_semi_anti_directly_on_lineitem(left)
+                    || any_semi_anti_directly_on_lineitem(right)
             }
             _ => false,
         }
     }
 
     assert!(
-        verify_q21_semi_anti_on_lineitem(&opt_q21),
-        "Q21 semi/anti joins must be pushed down to lineitem"
+        !any_semi_anti_directly_on_lineitem(&opt_q21),
+        "Q21 semi/anti joins must NOT be pushed down to lineitem (must keep original form)"
+    );
+
+    fn find_top_semi_anti(plan: &LogicalPlan) -> Option<(JoinType, JoinType)> {
+        match plan {
+            LogicalPlan::Join {
+                left,
+                join_type: jt1 @ JoinType::Anti,
+                ..
+            } => match left.as_ref() {
+                LogicalPlan::Join {
+                    join_type: jt2 @ JoinType::Semi,
+                    ..
+                } => Some((*jt1, *jt2)),
+                _ => None,
+            },
+            LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Project { input, .. }
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. } => find_top_semi_anti(input),
+            _ => None,
+        }
+    }
+
+    assert_eq!(
+        find_top_semi_anti(&opt_q21),
+        Some((JoinType::Anti, JoinType::Semi)),
+        "Q21 must keep Anti join wrapping Semi join at the top of the join tree"
     );
 }
