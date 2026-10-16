@@ -26,7 +26,11 @@ pub fn optimize(plan: LogicalPlan, stats: &HashMap<String, usize>) -> Result<Log
     let plan = order_joins(plan, stats)?;
     check_optimizer_step("order_joins", &plan, &root_schema)?;
 
-    // 5. Projection pruning
+    // 5. Push semi/anti joins below joins
+    let plan = push_semi_joins(plan)?;
+    check_optimizer_step("push_semi_joins", &plan, &root_schema)?;
+
+    // 6. Projection pruning
     // Base table columns are already pruned down to scans by bind.rs
     let plan = prune_projections(plan)?;
     check_optimizer_step("prune_projections", &plan, &root_schema)?;
@@ -2126,7 +2130,368 @@ pub fn swap_inner_joins_to_build_smaller(
 }
 
 // ============================================================================
-// 4. Projection Pruning
+// 5. Push Semi Joins Below Joins
+// ============================================================================
+
+pub fn push_semi_joins(plan: LogicalPlan) -> Result<LogicalPlan> {
+    match plan {
+        LogicalPlan::Scan { .. } => Ok(plan),
+        LogicalPlan::Filter { input, predicate } => {
+            let opt_input = push_semi_joins(*input)?;
+            Ok(LogicalPlan::Filter {
+                input: Box::new(opt_input),
+                predicate,
+            })
+        }
+        LogicalPlan::Project { input, exprs } => {
+            let opt_input = push_semi_joins(*input)?;
+            Ok(LogicalPlan::Project {
+                input: Box::new(opt_input),
+                exprs,
+            })
+        }
+        LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggs,
+        } => {
+            let opt_input = push_semi_joins(*input)?;
+            Ok(LogicalPlan::Aggregate {
+                input: Box::new(opt_input),
+                group_by,
+                aggs,
+            })
+        }
+        LogicalPlan::Sort { input, keys } => {
+            let opt_input = push_semi_joins(*input)?;
+            Ok(LogicalPlan::Sort {
+                input: Box::new(opt_input),
+                keys,
+            })
+        }
+        LogicalPlan::Limit { input, n } => {
+            let opt_input = push_semi_joins(*input)?;
+            Ok(LogicalPlan::Limit {
+                input: Box::new(opt_input),
+                n,
+            })
+        }
+        LogicalPlan::CrossJoin { left, right } => {
+            let opt_left = push_semi_joins(*left)?;
+            let opt_right = push_semi_joins(*right)?;
+            Ok(LogicalPlan::CrossJoin {
+                left: Box::new(opt_left),
+                right: Box::new(opt_right),
+            })
+        }
+        LogicalPlan::Join {
+            left,
+            right,
+            join_type: jt @ (JoinType::Semi | JoinType::Anti),
+            on,
+            filter,
+        } => {
+            let opt_left = push_semi_joins(*left)?;
+            let opt_right = push_semi_joins(*right)?;
+            push_semi_down(opt_left, opt_right, jt, on, filter)
+        }
+        LogicalPlan::Join {
+            left,
+            right,
+            join_type,
+            on,
+            filter,
+        } => {
+            let opt_left = push_semi_joins(*left)?;
+            let opt_right = push_semi_joins(*right)?;
+            Ok(LogicalPlan::Join {
+                left: Box::new(opt_left),
+                right: Box::new(opt_right),
+                join_type,
+                on,
+                filter,
+            })
+        }
+    }
+}
+
+fn push_semi_down(
+    left: LogicalPlan,
+    right: LogicalPlan,
+    join_type: JoinType,
+    on: Vec<(Expr, Expr)>,
+    filter: Option<Expr>,
+) -> Result<LogicalPlan> {
+    match left {
+        LogicalPlan::Project { input, exprs } => {
+            let proj_len = exprs.len();
+            let input_len = input.schema()?.len();
+            let new_on: Vec<(Expr, Expr)> = on
+                .into_iter()
+                .map(|(l, r)| (substitute_project(l, &exprs), r))
+                .collect();
+            let new_filter = filter.map(|f| remap_filter_project(f, &exprs, proj_len, input_len));
+            let pushed = push_semi_down(*input, right, join_type, new_on, new_filter)?;
+            Ok(LogicalPlan::Project {
+                input: Box::new(pushed),
+                exprs,
+            })
+        }
+        LogicalPlan::Filter { input, predicate } => match input.as_ref() {
+            LogicalPlan::Join { .. } | LogicalPlan::Project { .. } => {
+                let pushed = push_semi_down(*input, right, join_type, on, filter)?;
+                Ok(LogicalPlan::Filter {
+                    input: Box::new(pushed),
+                    predicate,
+                })
+            }
+            _ => Ok(LogicalPlan::Join {
+                left: Box::new(LogicalPlan::Filter { input, predicate }),
+                right: Box::new(right),
+                join_type,
+                on,
+                filter,
+            }),
+        },
+        LogicalPlan::Join {
+            left: inner_left,
+            right: inner_right,
+            join_type: inner_jt @ (JoinType::Semi | JoinType::Anti),
+            on: inner_on,
+            filter: inner_filter,
+        } => {
+            let pushed = push_semi_down(*inner_left, right, join_type, on, filter)?;
+            Ok(LogicalPlan::Join {
+                left: Box::new(pushed),
+                right: inner_right,
+                join_type: inner_jt,
+                on: inner_on,
+                filter: inner_filter,
+            })
+        }
+        LogicalPlan::Join {
+            left: inner_left,
+            right: inner_right,
+            join_type: JoinType::Inner,
+            on: inner_on,
+            filter: inner_filter,
+        } => {
+            let left_len = inner_left.schema()?.len();
+            let right_len = inner_right.schema()?.len();
+
+            let mut left_cols = HashSet::new();
+            for (l, _) in &on {
+                expr_references_columns(l, &mut left_cols);
+            }
+            if let Some(ref f) = filter {
+                let mut f_cols = HashSet::new();
+                expr_references_columns(f, &mut f_cols);
+                for c in f_cols {
+                    if c < left_len + right_len {
+                        left_cols.insert(c);
+                    }
+                }
+            }
+
+            let all_in_left = !left_cols.is_empty() && left_cols.iter().all(|&c| c < left_len);
+            let all_in_right = !left_cols.is_empty() && left_cols.iter().all(|&c| c >= left_len);
+
+            if all_in_left {
+                let new_filter = filter.map(|f| {
+                    remap_expr_indices(f, &|idx| {
+                        if idx < left_len {
+                            idx
+                        } else {
+                            idx - right_len
+                        }
+                    })
+                });
+                let pushed_left = push_semi_down(*inner_left, right, join_type, on, new_filter)?;
+                Ok(LogicalPlan::Join {
+                    left: Box::new(pushed_left),
+                    right: inner_right,
+                    join_type: JoinType::Inner,
+                    on: inner_on,
+                    filter: inner_filter,
+                })
+            } else if all_in_right {
+                let new_on = on
+                    .into_iter()
+                    .map(|(l, r)| (remap_expr_columns(l, -(left_len as i64)), r))
+                    .collect();
+                let new_filter = filter.map(|f| remap_expr_columns(f, -(left_len as i64)));
+                let pushed_right =
+                    push_semi_down(*inner_right, right, join_type, new_on, new_filter)?;
+                Ok(LogicalPlan::Join {
+                    left: inner_left,
+                    right: Box::new(pushed_right),
+                    join_type: JoinType::Inner,
+                    on: inner_on,
+                    filter: inner_filter,
+                })
+            } else {
+                Ok(LogicalPlan::Join {
+                    left: Box::new(LogicalPlan::Join {
+                        left: inner_left,
+                        right: inner_right,
+                        join_type: JoinType::Inner,
+                        on: inner_on,
+                        filter: inner_filter,
+                    }),
+                    right: Box::new(right),
+                    join_type,
+                    on,
+                    filter,
+                })
+            }
+        }
+        other => Ok(LogicalPlan::Join {
+            left: Box::new(other),
+            right: Box::new(right),
+            join_type,
+            on,
+            filter,
+        }),
+    }
+}
+
+fn substitute_project(expr: Expr, exprs: &[(Expr, String)]) -> Expr {
+    match expr {
+        Expr::Column(idx) => {
+            if idx < exprs.len() {
+                exprs[idx].0.clone()
+            } else {
+                Expr::Column(idx)
+            }
+        }
+        Expr::Literal(s) => Expr::Literal(s),
+        Expr::Not(e) => Expr::Not(Box::new(substitute_project(*e, exprs))),
+        Expr::Negate(e) => Expr::Negate(Box::new(substitute_project(*e, exprs))),
+        Expr::IsNull(e) => Expr::IsNull(Box::new(substitute_project(*e, exprs))),
+        Expr::Binary { op, left, right } => Expr::Binary {
+            op,
+            left: Box::new(substitute_project(*left, exprs)),
+            right: Box::new(substitute_project(*right, exprs)),
+        },
+        Expr::Extract { field, expr } => Expr::Extract {
+            field,
+            expr: Box::new(substitute_project(*expr, exprs)),
+        },
+        Expr::Substring { expr, start, len } => Expr::Substring {
+            expr: Box::new(substitute_project(*expr, exprs)),
+            start,
+            len,
+        },
+        Expr::Cast { expr, to } => Expr::Cast {
+            expr: Box::new(substitute_project(*expr, exprs)),
+            to,
+        },
+        Expr::Case { whens, else_expr } => Expr::Case {
+            whens: whens
+                .into_iter()
+                .map(|(c, v)| (substitute_project(c, exprs), substitute_project(v, exprs)))
+                .collect(),
+            else_expr: else_expr.map(|e| Box::new(substitute_project(*e, exprs))),
+        },
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: Box::new(substitute_project(*expr, exprs)),
+            list,
+            negated,
+        },
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+        } => Expr::Like {
+            expr: Box::new(substitute_project(*expr, exprs)),
+            pattern,
+            negated,
+        },
+    }
+}
+
+fn remap_filter_project(
+    expr: Expr,
+    exprs: &[(Expr, String)],
+    proj_len: usize,
+    input_len: usize,
+) -> Expr {
+    match expr {
+        Expr::Column(idx) => {
+            if idx < proj_len {
+                exprs[idx].0.clone()
+            } else {
+                Expr::Column(idx - proj_len + input_len)
+            }
+        }
+        Expr::Literal(s) => Expr::Literal(s),
+        Expr::Not(e) => Expr::Not(Box::new(remap_filter_project(
+            *e, exprs, proj_len, input_len,
+        ))),
+        Expr::Negate(e) => Expr::Negate(Box::new(remap_filter_project(
+            *e, exprs, proj_len, input_len,
+        ))),
+        Expr::IsNull(e) => Expr::IsNull(Box::new(remap_filter_project(
+            *e, exprs, proj_len, input_len,
+        ))),
+        Expr::Binary { op, left, right } => Expr::Binary {
+            op,
+            left: Box::new(remap_filter_project(*left, exprs, proj_len, input_len)),
+            right: Box::new(remap_filter_project(*right, exprs, proj_len, input_len)),
+        },
+        Expr::Extract { field, expr } => Expr::Extract {
+            field,
+            expr: Box::new(remap_filter_project(*expr, exprs, proj_len, input_len)),
+        },
+        Expr::Substring { expr, start, len } => Expr::Substring {
+            expr: Box::new(remap_filter_project(*expr, exprs, proj_len, input_len)),
+            start,
+            len,
+        },
+        Expr::Cast { expr, to } => Expr::Cast {
+            expr: Box::new(remap_filter_project(*expr, exprs, proj_len, input_len)),
+            to,
+        },
+        Expr::Case { whens, else_expr } => Expr::Case {
+            whens: whens
+                .into_iter()
+                .map(|(c, v)| {
+                    (
+                        remap_filter_project(c, exprs, proj_len, input_len),
+                        remap_filter_project(v, exprs, proj_len, input_len),
+                    )
+                })
+                .collect(),
+            else_expr: else_expr
+                .map(|e| Box::new(remap_filter_project(*e, exprs, proj_len, input_len))),
+        },
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: Box::new(remap_filter_project(*expr, exprs, proj_len, input_len)),
+            list,
+            negated,
+        },
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+        } => Expr::Like {
+            expr: Box::new(remap_filter_project(*expr, exprs, proj_len, input_len)),
+            pattern,
+            negated,
+        },
+    }
+}
+
+// ============================================================================
+// 6. Projection Pruning
 // ============================================================================
 
 pub fn prune_projections(plan: LogicalPlan) -> Result<LogicalPlan> {

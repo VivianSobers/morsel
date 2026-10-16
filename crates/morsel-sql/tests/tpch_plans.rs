@@ -618,8 +618,13 @@ fn test_optimizer_steps_preserve_schema_and_column_ranges() {
         let ordered = morsel_sql::optimize::order_joins(pushed, &stats).unwrap();
         morsel_sql::optimize::check_optimizer_step("order_joins", &ordered, &raw_schema).unwrap();
 
-        // 5. Prune projections
-        let pruned = morsel_sql::optimize::prune_projections(ordered).unwrap();
+        // 5. Push semi joins
+        let semi_pushed = morsel_sql::optimize::push_semi_joins(ordered).unwrap();
+        morsel_sql::optimize::check_optimizer_step("push_semi_joins", &semi_pushed, &raw_schema)
+            .unwrap();
+
+        // 6. Prune projections
+        let pruned = morsel_sql::optimize::prune_projections(semi_pushed).unwrap();
         morsel_sql::optimize::check_optimizer_step("prune_projections", &pruned, &raw_schema)
             .unwrap();
     }
@@ -860,4 +865,95 @@ fn test_q21_projection_pruning_decorrelated_subqueries() {
     }
     let lineitem_scans: Vec<_> = scans.iter().filter(|(t, _)| t == "lineitem").collect();
     assert_eq!(lineitem_scans.len(), 3);
+}
+
+#[test]
+fn test_push_semi_joins_below_joins_q18_and_q21() {
+    let catalog = tpch_schemas();
+    let stats = tpch_stats();
+    let root = repo_root();
+
+    // Q18: Semi join must be pushed directly to orders
+    let sql_q18 = fs::read_to_string(root.join("queries/tpch/q18.sql")).unwrap();
+    let plan_q18 = plan_sql(&sql_q18, &catalog).unwrap();
+    let opt_q18 = optimize(plan_q18, &stats).unwrap();
+
+    fn find_semi_join_left_table(plan: &LogicalPlan) -> Option<String> {
+        match plan {
+            LogicalPlan::Join {
+                left,
+                join_type: JoinType::Semi,
+                ..
+            } => match left.as_ref() {
+                LogicalPlan::Scan { table, .. } => Some(table.to_lowercase()),
+                LogicalPlan::Filter { input, .. } | LogicalPlan::Project { input, .. } => {
+                    match input.as_ref() {
+                        LogicalPlan::Scan { table, .. } => Some(table.to_lowercase()),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+            LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Project { input, .. }
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. } => find_semi_join_left_table(input),
+            LogicalPlan::Join { left, right, .. } | LogicalPlan::CrossJoin { left, right } => {
+                find_semi_join_left_table(left).or_else(|| find_semi_join_left_table(right))
+            }
+            _ => None,
+        }
+    }
+
+    assert_eq!(
+        find_semi_join_left_table(&opt_q18),
+        Some("orders".to_string()),
+        "Q18 semi join must be pushed directly down to orders"
+    );
+
+    // Q21: Semi and Anti joins must be pushed directly to lineitem
+    let sql_q21 = fs::read_to_string(root.join("queries/tpch/q21.sql")).unwrap();
+    let plan_q21 = plan_sql(&sql_q21, &catalog).unwrap();
+    let opt_q21 = optimize(plan_q21, &stats).unwrap();
+
+    fn verify_q21_semi_anti_on_lineitem(plan: &LogicalPlan) -> bool {
+        match plan {
+            LogicalPlan::Join {
+                left,
+                join_type: JoinType::Semi | JoinType::Anti,
+                ..
+            } => {
+                fn is_lineitem_target(p: &LogicalPlan) -> bool {
+                    match p {
+                        LogicalPlan::Scan { table, .. } => table.eq_ignore_ascii_case("lineitem"),
+                        LogicalPlan::Filter { input, .. } | LogicalPlan::Project { input, .. } => {
+                            is_lineitem_target(input)
+                        }
+                        LogicalPlan::Join {
+                            left,
+                            join_type: JoinType::Semi | JoinType::Anti,
+                            ..
+                        } => is_lineitem_target(left),
+                        _ => false,
+                    }
+                }
+                is_lineitem_target(left)
+            }
+            LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Project { input, .. }
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. } => verify_q21_semi_anti_on_lineitem(input),
+            LogicalPlan::Join { left, right, .. } | LogicalPlan::CrossJoin { left, right } => {
+                verify_q21_semi_anti_on_lineitem(left) || verify_q21_semi_anti_on_lineitem(right)
+            }
+            _ => false,
+        }
+    }
+
+    assert!(
+        verify_q21_semi_anti_on_lineitem(&opt_q21),
+        "Q21 semi/anti joins must be pushed down to lineitem"
+    );
 }
