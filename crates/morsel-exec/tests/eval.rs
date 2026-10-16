@@ -791,3 +791,37 @@ fn commutative_date_addition() {
     assert_eq!(res.dtype, DataType::Date32);
     assert_eq!(res.get(0), Scalar::Date32(1010));
 }
+
+#[test]
+fn case_differing_branch_types() {
+    let schema = Arc::new(Schema {
+        fields: vec![Field {
+            name: "val".to_string(),
+            dtype: DataType::Int32,
+            nullable: false,
+        }],
+    });
+    let batch = Batch::new(
+        schema,
+        vec![Arc::new(Column::from_scalars(
+            DataType::Int32,
+            &[Scalar::Int32(1), Scalar::Int32(2)],
+        ))],
+    );
+
+    let case_expr = Expr::Case {
+        whens: vec![(
+            Expr::Binary {
+                op: BinOp::Eq,
+                left: Box::new(Expr::Column(0)),
+                right: Box::new(Expr::Literal(Scalar::Int32(1))),
+            },
+            Expr::Literal(Scalar::Int32(1)),
+        )],
+        else_expr: Some(Box::new(Expr::Literal(Scalar::Int64(10_000_000_000)))),
+    };
+    let res = eval(&case_expr, &batch).unwrap();
+    assert_eq!(res.dtype, DataType::Int64);
+    assert_eq!(res.get(0), Scalar::Int64(1));
+    assert_eq!(res.get(1), Scalar::Int64(10_000_000_000));
+}
