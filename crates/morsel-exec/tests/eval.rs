@@ -825,3 +825,49 @@ fn case_differing_branch_types() {
     assert_eq!(res.get(0), Scalar::Int64(1));
     assert_eq!(res.get(1), Scalar::Int64(10_000_000_000));
 }
+
+#[test]
+fn like_multiline_and_escapes() {
+    let schema = Arc::new(Schema {
+        fields: vec![Field {
+            name: "s".to_string(),
+            dtype: DataType::Utf8,
+            nullable: false,
+        }],
+    });
+    let batch = Batch::new(
+        schema,
+        vec![Arc::new(Column::from_scalars(
+            DataType::Utf8,
+            &[
+                Scalar::Utf8("hello\nworld".to_string()),
+                Scalar::Utf8("100% discount".to_string()),
+                Scalar::Utf8("a_b".to_string()),
+            ],
+        ))],
+    );
+
+    let like_multi = Expr::Like {
+        expr: Box::new(Expr::Column(0)),
+        pattern: "%world".to_string(),
+        negated: false,
+    };
+    let res = eval(&like_multi, &batch).unwrap();
+    assert_eq!(res.get(0), Scalar::Bool(true));
+
+    let like_esc_pct = Expr::Like {
+        expr: Box::new(Expr::Column(0)),
+        pattern: r"100\% discount".to_string(),
+        negated: false,
+    };
+    let res = eval(&like_esc_pct, &batch).unwrap();
+    assert_eq!(res.get(1), Scalar::Bool(true));
+
+    let like_esc_underscore = Expr::Like {
+        expr: Box::new(Expr::Column(0)),
+        pattern: r"a\_b".to_string(),
+        negated: false,
+    };
+    let res = eval(&like_esc_underscore, &batch).unwrap();
+    assert_eq!(res.get(2), Scalar::Bool(true));
+}

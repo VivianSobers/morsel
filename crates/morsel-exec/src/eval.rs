@@ -15,12 +15,33 @@ fn pow10(n: u8) -> i128 {
 }
 
 fn like_to_regex(pattern: &str) -> Result<Regex> {
-    let mut regex_str = String::from("^");
-    for ch in pattern.chars() {
+    let mut regex_str = String::from("^(?s)");
+    let mut chars = pattern.chars().peekable();
+    while let Some(ch) = chars.next() {
         match ch {
+            '\\' => {
+                if let Some(next_ch) = chars.next() {
+                    match next_ch {
+                        '%' | '_' | '\\' => {
+                            regex_str.push('\\');
+                            regex_str.push(next_ch);
+                        }
+                        '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}'
+                        | '|' => {
+                            regex_str.push('\\');
+                            regex_str.push(next_ch);
+                        }
+                        c => {
+                            regex_str.push(c);
+                        }
+                    }
+                } else {
+                    regex_str.push_str("\\\\");
+                }
+            }
             '%' => regex_str.push_str(".*"),
             '_' => regex_str.push('.'),
-            '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\' => {
+            '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' => {
                 regex_str.push('\\');
                 regex_str.push(ch);
             }
