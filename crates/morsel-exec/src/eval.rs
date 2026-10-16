@@ -576,13 +576,18 @@ fn eval_arithmetic(op: BinOp, left: &Column, right: &Column, len: usize) -> Resu
                     BinOp::Mul => Scalar::Int64(x * y as i64),
                     _ => unreachable!(),
                 },
-                // Float op Float
-                (Scalar::Float64(x), Scalar::Float64(y)) => match op {
-                    BinOp::Add => Scalar::Float64(x + y),
-                    BinOp::Sub => Scalar::Float64(x - y),
-                    BinOp::Mul => Scalar::Float64(x * y),
-                    _ => unreachable!(),
-                },
+                // Float op Any Number / Any Number op Float
+                (ref left_val @ Scalar::Float64(_), ref right_val)
+                | (ref left_val, ref right_val @ Scalar::Float64(_)) => {
+                    let x = scalar_to_f64(left_val)?;
+                    let y = scalar_to_f64(right_val)?;
+                    match op {
+                        BinOp::Add => Scalar::Float64(x + y),
+                        BinOp::Sub => Scalar::Float64(x - y),
+                        BinOp::Mul => Scalar::Float64(x * y),
+                        _ => unreachable!(),
+                    }
+                }
                 // Date32 op Integer
                 (Scalar::Date32(d), Scalar::Int32(n)) => match op {
                     BinOp::Add => Scalar::Date32(d + n),
