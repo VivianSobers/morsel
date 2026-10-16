@@ -156,7 +156,7 @@ From `outcomes.json`:
 - **Missed**: 249
 - **Timeout**: 2
 - **Unviable**: 26
-- **Baseline success**: 0 (baseline passed, 0 surviving mutant errors during baseline)
+- **Baseline**: 1 entry with outcome `Success` (the unmutated build and tests passed before mutation began)
 
 ### Missed Mutants by File (`missed.txt`)
 

@@ -19,7 +19,7 @@ Morsel is an in-memory, vectorized analytical SQL engine written in Rust. It loa
 
 ## Current Status
 
-All 22/22 TPC-H queries execute successfully and match reference answer sets at Scale Factor 1 (SF1) and Scale Factor 10 (SF10) (verified at commit `b4532bd` and verified at commit `118f9f3`).
+All 22/22 TPC-H queries execute successfully and match reference answer sets at Scale Factor 1 (SF1) and Scale Factor 10 (SF10) (both scale factors verified at commit `b4532bd`; SF1 again at `118f9f3`).
 
 ---
 
