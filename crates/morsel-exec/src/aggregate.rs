@@ -294,7 +294,7 @@ impl AggState {
         Ok(())
     }
 
-    pub fn merge(&mut self, other: AggState) {
+    pub fn merge(&mut self, other: AggState) -> Result<()> {
         self.count += other.count;
         self.count_star += other.count_star;
         if let (Some(set), Some(other_set)) = (&mut self.distinct_set, other.distinct_set) {
@@ -306,7 +306,7 @@ impl AggState {
         self.has_sum |= other.has_sum;
         if let Some(other_min) = other.min {
             if self.min.is_none()
-                || compare_scalars(&other_min, self.min.as_ref().unwrap()).unwrap()
+                || compare_scalars(&other_min, self.min.as_ref().unwrap())?
                     == std::cmp::Ordering::Less
             {
                 self.min = Some(other_min);
@@ -314,12 +314,13 @@ impl AggState {
         }
         if let Some(other_max) = other.max {
             if self.max.is_none()
-                || compare_scalars(&other_max, self.max.as_ref().unwrap()).unwrap()
+                || compare_scalars(&other_max, self.max.as_ref().unwrap())?
                     == std::cmp::Ordering::Greater
             {
                 self.max = Some(other_max);
             }
         }
+        Ok(())
     }
 
     pub fn finalize(&self, func: AggFunc) -> Scalar {
@@ -493,7 +494,7 @@ pub fn execute_aggregate(
                 std::collections::hash_map::Entry::Occupied(mut occ) => {
                     let cur = occ.get_mut();
                     for (i, st) in states.into_iter().enumerate() {
-                        cur[i].merge(st);
+                        cur[i].merge(st)?;
                     }
                 }
                 std::collections::hash_map::Entry::Vacant(vac) => {

@@ -501,3 +501,13 @@ fn threads_do_not_change_result() {
     assert_eq!(to_map(&res1), to_map(&res3));
     assert_eq!(to_map(&res1), to_map(&res16));
 }
+
+#[test]
+fn agg_state_merge_handles_incompatible_scalars() {
+    let mut s1 = morsel_exec::aggregate::AggState::new(AggFunc::Min, Some(DataType::Int32));
+    s1.min = Some(Scalar::Int32(1));
+    let mut s2 = morsel_exec::aggregate::AggState::new(AggFunc::Min, Some(DataType::Utf8));
+    s2.min = Some(Scalar::Utf8("a".to_string()));
+    let res = s1.merge(s2);
+    assert!(res.is_err());
+}
