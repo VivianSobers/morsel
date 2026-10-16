@@ -639,8 +639,14 @@ fn eval_div(left: &Column, right: &Column, len: usize) -> Result<Column> {
         } else {
             let l_f64 = scalar_to_f64(&left.get(i))?;
             let r_f64 = scalar_to_f64(&right.get(i))?;
-            validity.push(true);
-            data.push(l_f64 / r_f64);
+            if r_f64 == 0.0 {
+                has_null = true;
+                validity.push(false);
+                data.push(0.0);
+            } else {
+                validity.push(true);
+                data.push(l_f64 / r_f64);
+            }
         }
     }
 

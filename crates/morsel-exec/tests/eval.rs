@@ -871,3 +871,45 @@ fn like_multiline_and_escapes() {
     let res = eval(&like_esc_underscore, &batch).unwrap();
     assert_eq!(res.get(2), Scalar::Bool(true));
 }
+
+#[test]
+fn div_by_zero_returns_null() {
+    let schema = Arc::new(Schema {
+        fields: vec![
+            Field {
+                name: "a".to_string(),
+                dtype: DataType::Float64,
+                nullable: false,
+            },
+            Field {
+                name: "b".to_string(),
+                dtype: DataType::Float64,
+                nullable: false,
+            },
+        ],
+    });
+    let batch = Batch::new(
+        schema,
+        vec![
+            Arc::new(Column::from_scalars(
+                DataType::Float64,
+                &[Scalar::Float64(10.0), Scalar::Float64(0.0)],
+            )),
+            Arc::new(Column::from_scalars(
+                DataType::Float64,
+                &[Scalar::Float64(0.0), Scalar::Float64(0.0)],
+            )),
+        ],
+    );
+    let div_expr = Expr::Binary {
+        op: BinOp::Div,
+        left: Box::new(Expr::Column(0)),
+        right: Box::new(Expr::Column(1)),
+    };
+    let res = eval(&div_expr, &batch).unwrap();
+    assert_eq!(res.dtype, DataType::Float64);
+    assert_eq!(res.get(0), Scalar::Null);
+    assert_eq!(res.get(1), Scalar::Null);
+    assert!(res.is_null(0));
+    assert!(res.is_null(1));
+}
