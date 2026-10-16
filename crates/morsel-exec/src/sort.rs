@@ -119,7 +119,7 @@ pub fn execute_sort(
 
     let schema = Arc::new(input.schema()?);
     let morsels = create_morsels(&input_batches);
-    let num_threads = threads.clamp(1, 16);
+    let num_threads = threads.max(1);
 
     // Compute global row offset for each morsel for stable tie-breaking
     let mut morsel_offsets = Vec::with_capacity(morsels.len());

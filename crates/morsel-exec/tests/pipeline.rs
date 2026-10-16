@@ -209,3 +209,20 @@ fn rows_not_multiple_of_batch() {
     let res = execute(&scan, &catalog, 2).unwrap();
     assert_eq!(count_rows(&res), 2500);
 }
+
+#[test]
+fn thirty_two_threads_works() {
+    let table = make_table(100_000);
+    let mut tables = HashMap::new();
+    let table_schema = (*table.schema).clone();
+    tables.insert("t".to_string(), table);
+    let catalog = Catalog { tables };
+
+    let scan = LogicalPlan::Scan {
+        table: "t".to_string(),
+        columns: vec![0],
+        table_schema,
+    };
+    let res = execute(&scan, &catalog, 32).unwrap();
+    assert_eq!(count_rows(&res), 100_000);
+}

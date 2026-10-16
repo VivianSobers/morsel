@@ -160,7 +160,7 @@ pub fn execute_join(
     }
 
     let num_morsels = morsels.len();
-    let num_threads = threads.clamp(1, 16);
+    let num_threads = threads.max(1);
     let queue = Arc::new(Mutex::new(VecDeque::from(morsels)));
     let results = Arc::new(Mutex::new(vec![Vec::new(); num_morsels]));
     let error_cell = Arc::new(Mutex::new(None));
@@ -400,7 +400,7 @@ pub fn execute_cross_join(
     }
 
     let num_morsels = morsels.len();
-    let num_threads = threads.clamp(1, 16);
+    let num_threads = threads.max(1);
     let queue = Arc::new(Mutex::new(VecDeque::from(morsels)));
     let results = Arc::new(Mutex::new(vec![Vec::new(); num_morsels]));
     let r_batches = Arc::new(right_batches);

@@ -24,7 +24,7 @@ pub fn load_parquet_dir_impl(dir: &Path, threads: usize) -> Result<Catalog> {
     }
     files.sort();
 
-    let num_threads = threads.clamp(1, 16).min(files.len().max(1));
+    let num_threads = threads.max(1).min(files.len().max(1));
     let files_queue = std::sync::Mutex::new(files.into_iter());
     let results_mutex = std::sync::Mutex::new(Vec::new());
 

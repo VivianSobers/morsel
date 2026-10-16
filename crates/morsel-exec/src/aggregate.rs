@@ -281,7 +281,7 @@ pub fn execute_aggregate(
         .collect::<Result<Vec<_>>>()?;
 
     let morsels = create_morsels(&input_batches);
-    let num_threads = threads.clamp(1, 16);
+    let num_threads = threads.max(1);
 
     let queue = Arc::new(Mutex::new(VecDeque::from(morsels)));
     let thread_maps: Arc<Mutex<Vec<AggMap>>> = Arc::new(Mutex::new(Vec::new()));
