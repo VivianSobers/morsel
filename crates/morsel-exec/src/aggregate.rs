@@ -477,10 +477,22 @@ pub fn execute_aggregate(
                 })
             })
             .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().unwrap())
-            .collect::<Vec<_>>()
+        let mut worker_panic = None;
+        let mut maps = Vec::with_capacity(handles.len());
+        for h in handles {
+            match h.join() {
+                Ok(local_map) => maps.push(local_map),
+                Err(payload) => {
+                    if worker_panic.is_none() {
+                        worker_panic = Some(payload);
+                    }
+                }
+            }
+        }
+        if let Some(payload) = worker_panic {
+            std::panic::resume_unwind(payload);
+        }
+        maps
     });
 
     if let Some(err) = error_cell.into_inner().unwrap() {

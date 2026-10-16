@@ -27,7 +27,39 @@ pub fn apply_limit(batches: Vec<Batch>, n: usize) -> Vec<Batch> {
     result
 }
 
+fn plan_operator_name(plan: &LogicalPlan) -> &'static str {
+    match plan {
+        LogicalPlan::Scan { .. } => "Scan",
+        LogicalPlan::Filter { .. } => "Filter",
+        LogicalPlan::Project { .. } => "Project",
+        LogicalPlan::Aggregate { .. } => "Aggregate",
+        LogicalPlan::Join { .. } => "Join",
+        LogicalPlan::CrossJoin { .. } => "CrossJoin",
+        LogicalPlan::Sort { .. } => "Sort",
+        LogicalPlan::Limit { .. } => "Limit",
+    }
+}
+
 pub fn execute(plan: &LogicalPlan, catalog: &Catalog, threads: usize) -> Result<Vec<Batch>> {
+    let op_name = plan_operator_name(plan);
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        execute_inner(plan, catalog, threads)
+    })) {
+        Ok(res) => res,
+        Err(payload) => {
+            let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic".to_string()
+            };
+            anyhow::bail!("{}: worker panicked: {}", op_name, msg)
+        }
+    }
+}
+
+fn execute_inner(plan: &LogicalPlan, catalog: &Catalog, threads: usize) -> Result<Vec<Batch>> {
     match plan {
         LogicalPlan::Limit { input, n } => {
             if let LogicalPlan::Sort {
