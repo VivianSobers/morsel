@@ -533,3 +533,48 @@ fn predicate_null_is_false() {
     let indices = eval_predicate(&pred, &batch).unwrap();
     assert_eq!(indices, vec![0, 3]);
 }
+
+#[test]
+fn float_mul_decimal() {
+    let schema = Arc::new(Schema {
+        fields: vec![
+            Field {
+                name: "f".to_string(),
+                dtype: DataType::Float64,
+                nullable: false,
+            },
+            Field {
+                name: "d".to_string(),
+                dtype: DataType::Decimal {
+                    precision: 15,
+                    scale: 2,
+                },
+                nullable: false,
+            },
+        ],
+    });
+    let batch = Batch::new(
+        schema,
+        vec![
+            Arc::new(Column::from_scalars(
+                DataType::Float64,
+                &[Scalar::Float64(100.0)],
+            )),
+            Arc::new(Column::from_scalars(
+                DataType::Decimal {
+                    precision: 15,
+                    scale: 2,
+                },
+                &[Scalar::Decimal(500, 2)],
+            )),
+        ],
+    );
+    let expr = Expr::Binary {
+        op: BinOp::Mul,
+        left: Box::new(Expr::Column(0)),
+        right: Box::new(Expr::Column(1)),
+    };
+    let res = eval(&expr, &batch).unwrap();
+    assert_eq!(res.dtype, DataType::Float64);
+    assert_eq!(res.get(0), Scalar::Float64(500.0));
+}
