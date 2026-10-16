@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod aggregate;
 pub mod catalog;
 pub mod eval;
 pub mod execute;

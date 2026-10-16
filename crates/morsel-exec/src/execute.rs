@@ -36,7 +36,11 @@ pub fn execute(plan: &LogicalPlan, catalog: &Catalog, threads: usize) -> Result<
         LogicalPlan::Scan { .. } | LogicalPlan::Filter { .. } | LogicalPlan::Project { .. } => {
             execute_scan_pipeline(plan, catalog, threads)
         }
-        LogicalPlan::Aggregate { .. } => bail!("unsupported plan variant: Aggregate"),
+        LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggs,
+        } => crate::aggregate::execute_aggregate(input, group_by, aggs, catalog, threads),
         LogicalPlan::Join { .. } => bail!("unsupported plan variant: Join"),
         LogicalPlan::CrossJoin { .. } => bail!("unsupported plan variant: CrossJoin"),
         LogicalPlan::Sort { .. } => bail!("unsupported plan variant: Sort"),
