@@ -226,3 +226,40 @@ fn thirty_two_threads_works() {
     let res = execute(&scan, &catalog, 32).unwrap();
     assert_eq!(count_rows(&res), 100_000);
 }
+
+#[test]
+fn project_over_aggregate() {
+    let table = make_table(1000);
+    let mut tables = HashMap::new();
+    let table_schema = (*table.schema).clone();
+    tables.insert("t".to_string(), table);
+    let catalog = Catalog { tables };
+
+    let scan = LogicalPlan::Scan {
+        table: "t".to_string(),
+        columns: vec![0, 1],
+        table_schema,
+    };
+    let agg = LogicalPlan::Aggregate {
+        input: Box::new(scan),
+        group_by: vec![(Expr::Column(0), "id".to_string())],
+        aggs: vec![(
+            morsel_plan::AggExpr {
+                func: morsel_plan::AggFunc::Sum,
+                arg: Some(Expr::Column(1)),
+            },
+            "sum_val".to_string(),
+        )],
+    };
+    let proj = LogicalPlan::Project {
+        input: Box::new(agg),
+        exprs: vec![
+            (Expr::Column(1), "sum_val".to_string()),
+            (Expr::Column(0), "id".to_string()),
+        ],
+    };
+    let res = execute(&proj, &catalog, 4).unwrap();
+    assert_eq!(count_rows(&res), 1000);
+    assert_eq!(res[0].schema.fields[0].name, "sum_val");
+    assert_eq!(res[0].schema.fields[1].name, "id");
+}

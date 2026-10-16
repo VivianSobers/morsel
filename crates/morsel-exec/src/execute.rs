@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use morsel_core::{Batch, Column, Schema};
 use morsel_plan::LogicalPlan;
 
@@ -42,7 +42,7 @@ pub fn execute(plan: &LogicalPlan, catalog: &Catalog, threads: usize) -> Result<
             }
         }
         LogicalPlan::Scan { .. } | LogicalPlan::Filter { .. } | LogicalPlan::Project { .. } => {
-            execute_scan_pipeline(plan, catalog, threads)
+            execute_pipeline(plan, catalog, threads)
         }
         LogicalPlan::Aggregate {
             input,
@@ -73,10 +73,15 @@ pub fn execute(plan: &LogicalPlan, catalog: &Catalog, threads: usize) -> Result<
     }
 }
 
-fn extract_scan_pipeline<'a>(
+enum PipelineSource<'a> {
+    Scan(&'a str, &'a [usize], &'a Schema),
+    Plan(&'a LogicalPlan),
+}
+
+fn extract_pipeline<'a>(
     plan: &'a LogicalPlan,
     ops: &mut Vec<PipelineOp>,
-) -> Result<(&'a str, &'a [usize], &'a Schema)> {
+) -> Result<PipelineSource<'a>> {
     match plan {
         LogicalPlan::Project { input, exprs } => {
             let schema = Arc::new(plan.schema()?);
@@ -84,112 +89,189 @@ fn extract_scan_pipeline<'a>(
                 exprs: exprs.clone(),
                 schema,
             });
-            extract_scan_pipeline(input, ops)
+            extract_pipeline(input, ops)
         }
         LogicalPlan::Filter { input, predicate } => {
             ops.push(PipelineOp::Filter(predicate.clone()));
-            extract_scan_pipeline(input, ops)
+            extract_pipeline(input, ops)
         }
         LogicalPlan::Scan {
             table,
             columns,
             table_schema,
-        } => Ok((table.as_str(), columns.as_slice(), table_schema)),
-        other => bail!("unsupported operator in scan pipeline: {:?}", other),
+        } => Ok(PipelineSource::Scan(
+            table.as_str(),
+            columns.as_slice(),
+            table_schema,
+        )),
+        other => Ok(PipelineSource::Plan(other)),
     }
 }
 
-fn execute_scan_pipeline(
-    plan: &LogicalPlan,
-    catalog: &Catalog,
-    threads: usize,
-) -> Result<Vec<Batch>> {
+fn execute_pipeline(plan: &LogicalPlan, catalog: &Catalog, threads: usize) -> Result<Vec<Batch>> {
     let mut ops = Vec::new();
-    let (table_name, columns, _table_schema) = extract_scan_pipeline(plan, &mut ops)?;
+    let source = extract_pipeline(plan, &mut ops)?;
     ops.reverse();
 
-    let table = catalog
-        .get_table(table_name)
-        .ok_or_else(|| anyhow::anyhow!("table not found: {}", table_name))?;
+    match source {
+        PipelineSource::Scan(table_name, columns, _table_schema) => {
+            let table = catalog
+                .get_table(table_name)
+                .ok_or_else(|| anyhow::anyhow!("table not found: {}", table_name))?;
 
-    let scan_fields = columns
-        .iter()
-        .map(|&idx| table.schema.fields[idx].clone())
-        .collect();
-    let scan_schema = Arc::new(Schema {
-        fields: scan_fields,
-    });
+            let scan_fields = columns
+                .iter()
+                .map(|&idx| table.schema.fields[idx].clone())
+                .collect();
+            let scan_schema = Arc::new(Schema {
+                fields: scan_fields,
+            });
 
-    let morsels = create_morsels(&table.batches);
-    if morsels.is_empty() {
-        return Ok(Vec::new());
-    }
+            let morsels = create_morsels(&table.batches);
+            if morsels.is_empty() {
+                return Ok(Vec::new());
+            }
 
-    let num_morsels = morsels.len();
-    let num_threads = threads.max(1);
-    let queue = Arc::new(Mutex::new(VecDeque::from(morsels)));
-    let results = Arc::new(Mutex::new(vec![Vec::new(); num_morsels]));
-    let error_cell = Arc::new(Mutex::new(None));
+            let num_morsels = morsels.len();
+            let num_threads = threads.max(1);
+            let queue = Arc::new(Mutex::new(VecDeque::from(morsels)));
+            let results = Arc::new(Mutex::new(vec![Vec::new(); num_morsels]));
+            let error_cell = Arc::new(Mutex::new(None));
 
-    std::thread::scope(|s| {
-        for _ in 0..num_threads {
-            let q = Arc::clone(&queue);
-            let res = Arc::clone(&results);
-            let err_cell = Arc::clone(&error_cell);
-            let ops_ref = &ops;
-            let scan_schema_ref = &scan_schema;
+            std::thread::scope(|s| {
+                for _ in 0..num_threads {
+                    let q = Arc::clone(&queue);
+                    let res = Arc::clone(&results);
+                    let err_cell = Arc::clone(&error_cell);
+                    let ops_ref = &ops;
+                    let scan_schema_ref = &scan_schema;
 
-            s.spawn(move || loop {
-                if err_cell.lock().unwrap().is_some() {
-                    break;
-                }
-                let morsel = {
-                    let mut locked_q = q.lock().unwrap();
-                    locked_q.pop_front()
-                };
-                let morsel = match morsel {
-                    Some(m) => m,
-                    None => break,
-                };
-
-                let mut morsel_results = Vec::new();
-                for base_batch in &morsel.batches {
-                    let scan_cols: Vec<Arc<Column>> = columns
-                        .iter()
-                        .map(|&idx| Arc::clone(&base_batch.columns[idx]))
-                        .collect();
-                    let scan_batch = Batch::new(Arc::clone(scan_schema_ref), scan_cols);
-                    match execute_streaming_batch(scan_batch, ops_ref) {
-                        Ok(Some(out_batch)) => {
-                            morsel_results.push(out_batch);
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            let mut locked_err = err_cell.lock().unwrap();
-                            if locked_err.is_none() {
-                                *locked_err = Some(e);
-                            }
+                    s.spawn(move || loop {
+                        if err_cell.lock().unwrap().is_some() {
                             break;
                         }
-                    }
+                        let morsel = {
+                            let mut locked_q = q.lock().unwrap();
+                            locked_q.pop_front()
+                        };
+                        let morsel = match morsel {
+                            Some(m) => m,
+                            None => break,
+                        };
+
+                        let mut morsel_results = Vec::new();
+                        for base_batch in &morsel.batches {
+                            let scan_cols: Vec<Arc<Column>> = columns
+                                .iter()
+                                .map(|&idx| Arc::clone(&base_batch.columns[idx]))
+                                .collect();
+                            let scan_batch = Batch::new(Arc::clone(scan_schema_ref), scan_cols);
+                            match execute_streaming_batch(scan_batch, ops_ref) {
+                                Ok(Some(out_batch)) => {
+                                    morsel_results.push(out_batch);
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    let mut locked_err = err_cell.lock().unwrap();
+                                    if locked_err.is_none() {
+                                        *locked_err = Some(e);
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        let mut locked_res = res.lock().unwrap();
+                        locked_res[morsel.id] = morsel_results;
+                    });
                 }
-                let mut locked_res = res.lock().unwrap();
-                locked_res[morsel.id] = morsel_results;
             });
+
+            if let Some(err) = Arc::try_unwrap(error_cell).unwrap().into_inner().unwrap() {
+                return Err(err);
+            }
+
+            let all_results: Vec<Batch> = Arc::try_unwrap(results)
+                .unwrap()
+                .into_inner()
+                .unwrap()
+                .into_iter()
+                .flatten()
+                .collect();
+
+            Ok(all_results)
         }
-    });
+        PipelineSource::Plan(input_plan) => {
+            let input_batches = execute(input_plan, catalog, threads)?;
+            if input_batches.is_empty() {
+                return Ok(Vec::new());
+            }
 
-    if let Some(err) = Arc::try_unwrap(error_cell).unwrap().into_inner().unwrap() {
-        return Err(err);
+            let morsels = create_morsels(&input_batches);
+            if morsels.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            let num_morsels = morsels.len();
+            let num_threads = threads.max(1);
+            let queue = Arc::new(Mutex::new(VecDeque::from(morsels)));
+            let results = Arc::new(Mutex::new(vec![Vec::new(); num_morsels]));
+            let error_cell = Arc::new(Mutex::new(None));
+
+            std::thread::scope(|s| {
+                for _ in 0..num_threads {
+                    let q = Arc::clone(&queue);
+                    let res = Arc::clone(&results);
+                    let err_cell = Arc::clone(&error_cell);
+                    let ops_ref = &ops;
+
+                    s.spawn(move || loop {
+                        if err_cell.lock().unwrap().is_some() {
+                            break;
+                        }
+                        let morsel = {
+                            let mut locked_q = q.lock().unwrap();
+                            locked_q.pop_front()
+                        };
+                        let morsel = match morsel {
+                            Some(m) => m,
+                            None => break,
+                        };
+
+                        let mut morsel_results = Vec::new();
+                        for base_batch in morsel.batches {
+                            match execute_streaming_batch(base_batch, ops_ref) {
+                                Ok(Some(out_batch)) => {
+                                    morsel_results.push(out_batch);
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    let mut locked_err = err_cell.lock().unwrap();
+                                    if locked_err.is_none() {
+                                        *locked_err = Some(e);
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        let mut locked_res = res.lock().unwrap();
+                        locked_res[morsel.id] = morsel_results;
+                    });
+                }
+            });
+
+            if let Some(err) = Arc::try_unwrap(error_cell).unwrap().into_inner().unwrap() {
+                return Err(err);
+            }
+
+            let all_results: Vec<Batch> = Arc::try_unwrap(results)
+                .unwrap()
+                .into_inner()
+                .unwrap()
+                .into_iter()
+                .flatten()
+                .collect();
+
+            Ok(all_results)
+        }
     }
-
-    let all_results: Vec<Batch> = Arc::try_unwrap(results)
-        .unwrap()
-        .into_inner()
-        .unwrap()
-        .into_iter()
-        .flatten()
-        .collect();
-
-    Ok(all_results)
 }
