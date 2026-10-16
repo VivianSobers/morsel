@@ -1448,17 +1448,22 @@ pub fn remap_expr_columns(expr: Expr, offset: i64) -> Expr {
 // ============================================================================
 
 pub fn order_joins(plan: LogicalPlan, stats: &HashMap<String, usize>) -> Result<LogicalPlan> {
+    let ordered = order_joins_structure(plan, stats)?;
+    swap_inner_joins_to_build_smaller(ordered, stats)
+}
+
+fn order_joins_structure(plan: LogicalPlan, stats: &HashMap<String, usize>) -> Result<LogicalPlan> {
     match plan {
         LogicalPlan::Scan { .. } => Ok(plan),
         LogicalPlan::Filter { input, predicate } => {
-            let opt_input = order_joins(*input, stats)?;
+            let opt_input = order_joins_structure(*input, stats)?;
             Ok(LogicalPlan::Filter {
                 input: Box::new(opt_input),
                 predicate,
             })
         }
         LogicalPlan::Project { input, exprs } => {
-            let opt_input = order_joins(*input, stats)?;
+            let opt_input = order_joins_structure(*input, stats)?;
             Ok(LogicalPlan::Project {
                 input: Box::new(opt_input),
                 exprs,
@@ -1469,7 +1474,7 @@ pub fn order_joins(plan: LogicalPlan, stats: &HashMap<String, usize>) -> Result<
             group_by,
             aggs,
         } => {
-            let opt_input = order_joins(*input, stats)?;
+            let opt_input = order_joins_structure(*input, stats)?;
             Ok(LogicalPlan::Aggregate {
                 input: Box::new(opt_input),
                 group_by,
@@ -1477,14 +1482,14 @@ pub fn order_joins(plan: LogicalPlan, stats: &HashMap<String, usize>) -> Result<
             })
         }
         LogicalPlan::Sort { input, keys } => {
-            let opt_input = order_joins(*input, stats)?;
+            let opt_input = order_joins_structure(*input, stats)?;
             Ok(LogicalPlan::Sort {
                 input: Box::new(opt_input),
                 keys,
             })
         }
         LogicalPlan::Limit { input, n } => {
-            let opt_input = order_joins(*input, stats)?;
+            let opt_input = order_joins_structure(*input, stats)?;
             Ok(LogicalPlan::Limit {
                 input: Box::new(opt_input),
                 n,
@@ -1505,8 +1510,8 @@ pub fn order_joins(plan: LogicalPlan, stats: &HashMap<String, usize>) -> Result<
             on,
             filter,
         } => {
-            let opt_left = order_joins(*left, stats)?;
-            let opt_right = order_joins(*right, stats)?;
+            let opt_left = order_joins_structure(*left, stats)?;
+            let opt_right = order_joins_structure(*right, stats)?;
             Ok(LogicalPlan::Join {
                 left: Box::new(opt_left),
                 right: Box::new(opt_right),
@@ -1960,9 +1965,163 @@ fn estimate_rows(plan: &LogicalPlan, stats: &HashMap<String, usize>) -> f64 {
             let base = estimate_rows(input, stats);
             (base * 0.1).max(1.0)
         }
-        LogicalPlan::Aggregate { .. } => 100.0,
+        LogicalPlan::Project { input, .. } | LogicalPlan::Sort { input, .. } => {
+            estimate_rows(input, stats)
+        }
+        LogicalPlan::Aggregate {
+            input, group_by, ..
+        } => {
+            if group_by.is_empty() {
+                1.0
+            } else {
+                let base = estimate_rows(input, stats);
+                (base * 0.1).clamp(1.0, 100_000.0)
+            }
+        }
         LogicalPlan::Limit { n, .. } => *n as f64,
-        _ => 1000.0,
+        LogicalPlan::Join {
+            left,
+            right,
+            join_type,
+            ..
+        } => {
+            let l = estimate_rows(left, stats);
+            let r = estimate_rows(right, stats);
+            match join_type {
+                JoinType::Semi | JoinType::Anti => l,
+                JoinType::Left => l,
+                JoinType::Inner => l.max(r),
+            }
+        }
+        LogicalPlan::CrossJoin { left, right } => {
+            estimate_rows(left, stats) * estimate_rows(right, stats)
+        }
+    }
+}
+
+pub fn swap_inner_joins_to_build_smaller(
+    plan: LogicalPlan,
+    stats: &HashMap<String, usize>,
+) -> Result<LogicalPlan> {
+    match plan {
+        LogicalPlan::Scan { .. } => Ok(plan),
+        LogicalPlan::Filter { input, predicate } => {
+            let opt_input = swap_inner_joins_to_build_smaller(*input, stats)?;
+            Ok(LogicalPlan::Filter {
+                input: Box::new(opt_input),
+                predicate,
+            })
+        }
+        LogicalPlan::Project { input, exprs } => {
+            let opt_input = swap_inner_joins_to_build_smaller(*input, stats)?;
+            Ok(LogicalPlan::Project {
+                input: Box::new(opt_input),
+                exprs,
+            })
+        }
+        LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggs,
+        } => {
+            let opt_input = swap_inner_joins_to_build_smaller(*input, stats)?;
+            Ok(LogicalPlan::Aggregate {
+                input: Box::new(opt_input),
+                group_by,
+                aggs,
+            })
+        }
+        LogicalPlan::Sort { input, keys } => {
+            let opt_input = swap_inner_joins_to_build_smaller(*input, stats)?;
+            Ok(LogicalPlan::Sort {
+                input: Box::new(opt_input),
+                keys,
+            })
+        }
+        LogicalPlan::Limit { input, n } => {
+            let opt_input = swap_inner_joins_to_build_smaller(*input, stats)?;
+            Ok(LogicalPlan::Limit {
+                input: Box::new(opt_input),
+                n,
+            })
+        }
+        LogicalPlan::CrossJoin { left, right } => {
+            let opt_left = swap_inner_joins_to_build_smaller(*left, stats)?;
+            let opt_right = swap_inner_joins_to_build_smaller(*right, stats)?;
+            Ok(LogicalPlan::CrossJoin {
+                left: Box::new(opt_left),
+                right: Box::new(opt_right),
+            })
+        }
+        LogicalPlan::Join {
+            left,
+            right,
+            join_type,
+            on,
+            filter,
+        } => {
+            let opt_left = swap_inner_joins_to_build_smaller(*left, stats)?;
+            let opt_right = swap_inner_joins_to_build_smaller(*right, stats)?;
+
+            if join_type == JoinType::Inner {
+                let left_est = estimate_rows(&opt_left, stats);
+                let right_est = estimate_rows(&opt_right, stats);
+
+                // morsel-exec uses right as the build side and left as the probe side.
+                // If left has strictly fewer rows than right, swap them so the smaller
+                // side is on the right (build) and the larger side streams on the left (probe).
+                if left_est < right_est {
+                    let left_schema = opt_left.schema()?;
+                    let right_schema = opt_right.schema()?;
+                    let left_len = left_schema.len();
+                    let right_len = right_schema.len();
+
+                    let swapped_on: Vec<(Expr, Expr)> =
+                        on.into_iter().map(|(l, r)| (r, l)).collect();
+                    let swapped_filter = filter.map(|f| {
+                        remap_expr_indices(f, &|idx| {
+                            if idx < left_len {
+                                idx + right_len
+                            } else {
+                                idx - left_len
+                            }
+                        })
+                    });
+
+                    let swapped_join = LogicalPlan::Join {
+                        left: Box::new(opt_right),
+                        right: Box::new(opt_left),
+                        join_type: JoinType::Inner,
+                        on: swapped_on,
+                        filter: swapped_filter,
+                    };
+
+                    let mut exprs = Vec::with_capacity(left_len + right_len);
+                    for i in 0..left_len {
+                        exprs.push((
+                            Expr::Column(right_len + i),
+                            left_schema.fields[i].name.clone(),
+                        ));
+                    }
+                    for j in 0..right_len {
+                        exprs.push((Expr::Column(j), right_schema.fields[j].name.clone()));
+                    }
+
+                    return Ok(LogicalPlan::Project {
+                        input: Box::new(swapped_join),
+                        exprs,
+                    });
+                }
+            }
+
+            Ok(LogicalPlan::Join {
+                left: Box::new(opt_left),
+                right: Box::new(opt_right),
+                join_type,
+                on,
+                filter,
+            })
+        }
     }
 }
 

@@ -745,3 +745,61 @@ fn test_q5_join_order_avoids_customer_supplier_nationkey_cross() {
 
     check_joins(&optimized);
 }
+
+#[test]
+fn test_q9_and_q17_build_hash_table_on_smaller_side() {
+    let catalog = tpch_schemas();
+    let mut stats = HashMap::new();
+    stats.insert("region".into(), 5);
+    stats.insert("nation".into(), 25);
+    stats.insert("supplier".into(), 100_000);
+    stats.insert("customer".into(), 1_500_000);
+    stats.insert("part".into(), 2_000_000);
+    stats.insert("partsupp".into(), 8_000_000);
+    stats.insert("orders".into(), 15_000_000);
+    stats.insert("lineitem".into(), 60_000_000);
+
+    let root = repo_root();
+
+    fn check_build_side_not_lineitem(plan: &LogicalPlan, q: usize) {
+        match plan {
+            LogicalPlan::Join {
+                left,
+                right,
+                join_type,
+                ..
+            } => {
+                if *join_type == JoinType::Inner {
+                    // Right is the build side in morsel-exec.
+                    // Lineitem (60M rows) should never be the build side when joined with smaller tables.
+                    if let LogicalPlan::Scan { table, .. } = right.as_ref() {
+                        assert_ne!(
+                            table.to_lowercase(),
+                            "lineitem",
+                            "Q{:02} has lineitem on the right (build) side of an inner join!",
+                            q
+                        );
+                    }
+                }
+                check_build_side_not_lineitem(left, q);
+                check_build_side_not_lineitem(right, q);
+            }
+            LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Project { input, .. }
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. } => {
+                check_build_side_not_lineitem(input, q);
+            }
+            _ => {}
+        }
+    }
+
+    for &q in &[9, 17] {
+        let sql_path = root.join("queries/tpch").join(format!("q{:02}.sql", q));
+        let sql = fs::read_to_string(&sql_path).unwrap();
+        let plan = plan_sql(&sql, &catalog).unwrap();
+        let optimized = optimize(plan, &stats).unwrap();
+        check_build_side_not_lineitem(&optimized, q);
+    }
+}
