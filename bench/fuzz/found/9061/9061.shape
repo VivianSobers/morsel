@@ -1,0 +1,1 @@
+Scan(partsupp) -> Join(supplier, Left) -> Agg(1, 1) -> Sort -> Limit(40)
