@@ -17,7 +17,14 @@ pub fn scalar_to_csv_string(s: &Scalar) -> String {
         }
         Scalar::Int32(x) => x.to_string(),
         Scalar::Int64(x) => x.to_string(),
-        Scalar::Float64(f) => format!("{}", f),
+        Scalar::Float64(f) => {
+            let rounded = (*f * 1e10).round() / 1e10;
+            if (*f - rounded).abs() < 1e-12 {
+                format!("{}", rounded)
+            } else {
+                format!("{}", f)
+            }
+        }
         Scalar::Decimal(v, scale) => {
             if *scale == 0 {
                 v.to_string()
