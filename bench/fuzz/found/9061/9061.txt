@@ -1,0 +1,163 @@
+Limit {
+    input: Sort {
+        input: Aggregate {
+            input: Join {
+                left: Scan {
+                    table: "partsupp",
+                    columns: [
+                        0,
+                        1,
+                        2,
+                        3,
+                        4,
+                    ],
+                    table_schema: Schema {
+                        fields: [
+                            Field {
+                                name: "ps_partkey",
+                                dtype: Int64,
+                                nullable: true,
+                            },
+                            Field {
+                                name: "ps_suppkey",
+                                dtype: Int64,
+                                nullable: true,
+                            },
+                            Field {
+                                name: "ps_availqty",
+                                dtype: Int64,
+                                nullable: true,
+                            },
+                            Field {
+                                name: "ps_supplycost",
+                                dtype: Decimal {
+                                    precision: 15,
+                                    scale: 2,
+                                },
+                                nullable: true,
+                            },
+                            Field {
+                                name: "ps_comment",
+                                dtype: Utf8,
+                                nullable: true,
+                            },
+                        ],
+                    },
+                },
+                right: Scan {
+                    table: "supplier",
+                    columns: [
+                        0,
+                        1,
+                        2,
+                        3,
+                        4,
+                        5,
+                    ],
+                    table_schema: Schema {
+                        fields: [
+                            Field {
+                                name: "s_suppkey",
+                                dtype: Int64,
+                                nullable: true,
+                            },
+                            Field {
+                                name: "s_name",
+                                dtype: Utf8,
+                                nullable: true,
+                            },
+                            Field {
+                                name: "s_address",
+                                dtype: Utf8,
+                                nullable: true,
+                            },
+                            Field {
+                                name: "s_nationkey",
+                                dtype: Int32,
+                                nullable: true,
+                            },
+                            Field {
+                                name: "s_phone",
+                                dtype: Utf8,
+                                nullable: true,
+                            },
+                            Field {
+                                name: "s_acctbal",
+                                dtype: Decimal {
+                                    precision: 15,
+                                    scale: 2,
+                                },
+                                nullable: true,
+                            },
+                            Field {
+                                name: "s_comment",
+                                dtype: Utf8,
+                                nullable: true,
+                            },
+                        ],
+                    },
+                },
+                join_type: Left,
+                on: [
+                    (
+                        Column(
+                            1,
+                        ),
+                        Column(
+                            0,
+                        ),
+                    ),
+                ],
+                filter: Some(
+                    Binary {
+                        op: LtEq,
+                        left: Column(
+                            0,
+                        ),
+                        right: Column(
+                            5,
+                        ),
+                    },
+                ),
+            },
+            group_by: [
+                (
+                    Column(
+                        8,
+                    ),
+                    "s_nationkey",
+                ),
+            ],
+            aggs: [
+                (
+                    AggExpr {
+                        func: CountDistinct,
+                        arg: Some(
+                            Column(
+                                8,
+                            ),
+                        ),
+                    },
+                    "agg_0",
+                ),
+            ],
+        },
+        keys: [
+            SortKey {
+                expr: Column(
+                    0,
+                ),
+                asc: true,
+                nulls_first: false,
+            },
+            SortKey {
+                expr: Column(
+                    1,
+                ),
+                asc: true,
+                nulls_first: false,
+            },
+        ],
+    },
+    n: 40,
+}
