@@ -38,9 +38,22 @@ fn date32_to_year(days: i32) -> i64 {
 pub fn eval_predicate(expr: &Expr, batch: &Batch) -> Result<Vec<u32>> {
     let col = eval(expr, batch)?;
     let mut selected = Vec::new();
-    for i in 0..col.len() {
-        if !col.is_null(i) && col.get(i) == Scalar::Bool(true) {
-            selected.push(i as u32);
+    if let ColumnData::Bool(ref v) = col.data {
+        match &col.validity {
+            Some(val) => {
+                for (i, &b) in v.iter().enumerate() {
+                    if val[i] && b {
+                        selected.push(i as u32);
+                    }
+                }
+            }
+            None => {
+                for (i, &b) in v.iter().enumerate() {
+                    if b {
+                        selected.push(i as u32);
+                    }
+                }
+            }
         }
     }
     Ok(selected)
@@ -57,21 +70,59 @@ pub fn eval(expr: &Expr, batch: &Batch) -> Result<Column> {
             Ok((**col).clone())
         }
         Expr::Literal(scalar) => {
-            let dtype = match scalar {
-                Scalar::Null => DataType::Int32, // Default if untyped
-                Scalar::Bool(_) => DataType::Bool,
-                Scalar::Int32(_) => DataType::Int32,
-                Scalar::Int64(_) => DataType::Int64,
-                Scalar::Float64(_) => DataType::Float64,
-                Scalar::Decimal(_, scale) => DataType::Decimal {
-                    precision: 38,
-                    scale: *scale,
-                },
-                Scalar::Date32(_) => DataType::Date32,
-                Scalar::Utf8(_) => DataType::Utf8,
+            let (dtype, data, validity) = match scalar {
+                Scalar::Null => (
+                    DataType::Int32,
+                    ColumnData::Int32(vec![0; row_count]),
+                    Some(vec![false; row_count]),
+                ),
+                Scalar::Bool(b) => (DataType::Bool, ColumnData::Bool(vec![*b; row_count]), None),
+                Scalar::Int32(x) => (
+                    DataType::Int32,
+                    ColumnData::Int32(vec![*x; row_count]),
+                    None,
+                ),
+                Scalar::Int64(x) => (
+                    DataType::Int64,
+                    ColumnData::Int64(vec![*x; row_count]),
+                    None,
+                ),
+                Scalar::Float64(f) => (
+                    DataType::Float64,
+                    ColumnData::Float64(vec![*f; row_count]),
+                    None,
+                ),
+                Scalar::Decimal(x, scale) => (
+                    DataType::Decimal {
+                        precision: 38,
+                        scale: *scale,
+                    },
+                    ColumnData::Decimal(vec![*x; row_count]),
+                    None,
+                ),
+                Scalar::Date32(d) => (
+                    DataType::Date32,
+                    ColumnData::Date32(vec![*d; row_count]),
+                    None,
+                ),
+                Scalar::Utf8(st) => {
+                    let b = st.as_bytes();
+                    let len = b.len() as u32;
+                    let mut offsets = Vec::with_capacity(row_count + 1);
+                    offsets.push(0);
+                    let mut bytes = Vec::with_capacity(row_count * b.len());
+                    for i in 0..row_count {
+                        bytes.extend_from_slice(b);
+                        offsets.push((i + 1) as u32 * len);
+                    }
+                    (DataType::Utf8, ColumnData::Utf8 { offsets, bytes }, None)
+                }
             };
-            let values = vec![scalar.clone(); row_count];
-            Ok(Column::from_scalars(dtype, &values))
+            Ok(Column {
+                dtype,
+                data,
+                validity,
+            })
         }
         Expr::Binary { op, left, right } => {
             let left_col = eval(left, batch)?;
