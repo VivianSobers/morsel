@@ -1,0 +1,221 @@
+Sort {
+    input: Aggregate {
+        input: Join {
+            left: Scan {
+                table: "customer",
+                columns: [
+                    0,
+                    1,
+                    3,
+                    4,
+                ],
+                table_schema: Schema {
+                    fields: [
+                        Field {
+                            name: "c_custkey",
+                            dtype: Int64,
+                            nullable: true,
+                        },
+                        Field {
+                            name: "c_name",
+                            dtype: Utf8,
+                            nullable: true,
+                        },
+                        Field {
+                            name: "c_address",
+                            dtype: Utf8,
+                            nullable: true,
+                        },
+                        Field {
+                            name: "c_nationkey",
+                            dtype: Int32,
+                            nullable: true,
+                        },
+                        Field {
+                            name: "c_phone",
+                            dtype: Utf8,
+                            nullable: true,
+                        },
+                        Field {
+                            name: "c_acctbal",
+                            dtype: Decimal {
+                                precision: 15,
+                                scale: 2,
+                            },
+                            nullable: true,
+                        },
+                        Field {
+                            name: "c_mktsegment",
+                            dtype: Utf8,
+                            nullable: true,
+                        },
+                        Field {
+                            name: "c_comment",
+                            dtype: Utf8,
+                            nullable: true,
+                        },
+                    ],
+                },
+            },
+            right: Scan {
+                table: "orders",
+                columns: [
+                    1,
+                    4,
+                    5,
+                    8,
+                ],
+                table_schema: Schema {
+                    fields: [
+                        Field {
+                            name: "o_orderkey",
+                            dtype: Int64,
+                            nullable: true,
+                        },
+                        Field {
+                            name: "o_custkey",
+                            dtype: Int64,
+                            nullable: true,
+                        },
+                        Field {
+                            name: "o_orderstatus",
+                            dtype: Utf8,
+                            nullable: true,
+                        },
+                        Field {
+                            name: "o_totalprice",
+                            dtype: Decimal {
+                                precision: 15,
+                                scale: 2,
+                            },
+                            nullable: true,
+                        },
+                        Field {
+                            name: "o_orderdate",
+                            dtype: Date32,
+                            nullable: true,
+                        },
+                        Field {
+                            name: "o_orderpriority",
+                            dtype: Utf8,
+                            nullable: true,
+                        },
+                        Field {
+                            name: "o_clerk",
+                            dtype: Utf8,
+                            nullable: true,
+                        },
+                        Field {
+                            name: "o_shippriority",
+                            dtype: Int32,
+                            nullable: true,
+                        },
+                        Field {
+                            name: "o_comment",
+                            dtype: Utf8,
+                            nullable: true,
+                        },
+                    ],
+                },
+            },
+            join_type: Left,
+            on: [
+                (
+                    Column(
+                        0,
+                    ),
+                    Column(
+                        0,
+                    ),
+                ),
+            ],
+            filter: None,
+        },
+        group_by: [
+            (
+                Column(
+                    2,
+                ),
+                "c_nationkey",
+            ),
+            (
+                Column(
+                    6,
+                ),
+                "o_orderpriority",
+            ),
+        ],
+        aggs: [
+            (
+                AggExpr {
+                    func: Max,
+                    arg: Some(
+                        Column(
+                            5,
+                        ),
+                    ),
+                },
+                "agg_0",
+            ),
+            (
+                AggExpr {
+                    func: Max,
+                    arg: Some(
+                        Column(
+                            1,
+                        ),
+                    ),
+                },
+                "agg_1",
+            ),
+            (
+                AggExpr {
+                    func: Max,
+                    arg: Some(
+                        Column(
+                            3,
+                        ),
+                    ),
+                },
+                "agg_2",
+            ),
+        ],
+    },
+    keys: [
+        SortKey {
+            expr: Column(
+                0,
+            ),
+            asc: true,
+            nulls_first: false,
+        },
+        SortKey {
+            expr: Column(
+                1,
+            ),
+            asc: true,
+            nulls_first: false,
+        },
+        SortKey {
+            expr: Column(
+                2,
+            ),
+            asc: true,
+            nulls_first: false,
+        },
+        SortKey {
+            expr: Column(
+                3,
+            ),
+            asc: true,
+            nulls_first: false,
+        },
+        SortKey {
+            expr: Column(
+                4,
+            ),
+            asc: true,
+            nulls_first: false,
+        },
+    ],
+}

@@ -1,0 +1,1 @@
+Scan(lineitem) -> Filter(1) -> Agg(1, 1) -> Sort

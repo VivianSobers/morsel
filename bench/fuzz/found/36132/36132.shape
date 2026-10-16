@@ -1,0 +1,1 @@
+Scan(customer) -> Join(orders, Left) -> Project -> Agg(2, 1) -> Sort -> Limit(20)

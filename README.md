@@ -1,117 +1,88 @@
 # morsel
 
-morsel is an in-memory analytical SQL engine written in Rust. It loads tables into memory as columnar data, compiles SQL queries into logical execution plans, and executes them with vectorized operators scheduled as fine-grained morsels that can be processed by any available worker thread. The primary goal for v1 is running all 22 TPC-H queries at scale factors 1 and 10, verifying every query result against DuckDB reference answers, and comparing execution times against DuckDB, Polars, and DataFusion on identical hardware.
+Morsel is an in-memory, vectorized analytical SQL engine written in Rust. It loads tables into memory as columnar data, compiles SQL queries into logical execution plans via a rule-based optimizer, and executes them with vectorized operators scheduled as fine-grained morsels across worker threads to achieve high core utilization and low query latency.
 
-## Status
+---
 
-The core data structures (`morsel-core`), logical plan representation (`morsel-plan`), and vectorized morsel execution engine (`morsel-exec`) are implemented. Hand-built logical plans for TPC-H queries Q1 and Q6 are verified against reference data and pass in `crates/morsel-exec/tests/tpch_hand.rs`. The SQL parser and binder (`morsel-sql`) and support for the remaining TPC-H queries are currently in progress.
+## Workspace Crates
 
-## Crate Layout
+| Crate | Description |
+|:---|:---|
+| `crates/morsel-core` | Foundational columnar data types (`Column`, `Batch`, `Schema`, `DataType`, `Scalar`) and compute kernels. |
+| `crates/morsel-plan` | Logical plan intermediate representation (`LogicalPlan`, `Expr`), operator definitions, and schema resolution. |
+| `crates/morsel-exec` | In-memory table catalog, Parquet loader, vectorized expression evaluator, parallel morsel scheduler, and physical operators. |
+| `crates/morsel-sql` | SQL text frontend: parsing via `sqlparser`, name binding, type coercion, subquery decorrelation, and rule-based query optimization. |
+| `crates/morsel-fuzz` | Differential query plan generator, random plan execution, and drop-minimizer for fuzzing against DuckDB. |
+| `crates/morsel-cli` | Command-line interface (`morsel query`) executing SQL queries on Parquet data directories with CSV and timing JSON outputs. |
 
-| Crate / Directory | Description |
-|:--|:--|
-| `crates/morsel-core` | Core data types (`DataType`, `Scalar`, `Column`, `Batch`, `Schema`). Independent of other engine crates. |
-| `crates/morsel-plan` | Logical plan IR (`LogicalPlan`), expression representations (`Expr`), and the `SchemaProvider` trait. |
-| `crates/morsel-exec` | In-memory table catalog, Parquet loader, vectorized expression evaluation, parallel morsel scheduler, and physical operators (`execute`). |
-| `crates/morsel-sql` | SQL text frontend: parsing via `sqlparser`, name binding, type inference, and rule-based query optimization. |
-| `crates/morsel-cli` | Command-line interface for executing queries, loading Parquet datasets, and outputting CSV results with timing metrics. |
-| `bench/` | Python utilities for TPC-H data generation (`gen_tpch.py`), answer verification (`check.py`), and baseline benchmarking (`baselines.py`). |
+---
 
-## Building and Testing
+## Current Status
 
-### Prerequisites
+All 22/22 TPC-H queries execute successfully and match reference answer sets at Scale Factor 1 (SF1) and Scale Factor 10 (SF10) (verified at commit `b4532bd` and verified at commit `118f9f3`).
 
-- Rust 1.99 or later (stable toolchain)
-- Python 3.10 or later (for benchmark tooling and verification tests)
+---
+
+## Build and Run
 
 ### Build
 
-Compile the workspace:
+Compile the workspace in release mode:
 
 ```bash
-cargo build
+cargo build --release
 ```
 
-### Formatting and Linting
+The resulting binaries are located in `target/release/` (`morsel` and `morsel-fuzz`).
 
-Check code formatting and run clippy without warnings:
+### Generating Data
+
+Generate TPC-H Parquet tables and reference CSV answer sets using `bench/gen_tpch.py` (requires DuckDB and Python dependencies from `bench/requirements.txt`):
 
 ```bash
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
+python bench/gen_tpch.py --sf 1 --data-dir /path/to/data/sf1 --refs-dir bench/refs/sf1
 ```
 
-### Running Tests
+### Running Queries
 
-Run all unit and integration tests:
+Execute a SQL query against a directory of Parquet tables using the `morsel` CLI:
 
 ```bash
-cargo test
-python -m unittest bench/test_check.py
+morsel query --data /path/to/data/sf1 --sql-file queries/tpch/q01.sql
 ```
 
-To run the hand-built TPC-H integration tests against generated Parquet data:
+Additional options:
+- `--threads T`: Number of worker threads (default: available system threads).
+- `--out FILE.csv`: Write query results to a CSV file.
+- `--timing-json FILE.json`: Record query execution phases and durations in JSON format.
+
+### Explaining Plans
+
+To inspect the optimized logical query plan without executing:
 
 ```bash
-MORSEL_TPCH_DIR=/path/to/tpch/parquet cargo test -p morsel-exec --test tpch_hand
+morsel query --data /path/to/data/sf1 --sql-file queries/tpch/q01.sql --explain
 ```
 
-## Generating Data and Reference Answers
+### End-to-End Verification
 
-TPC-H dataset generation uses DuckDB via `bench/gen_tpch.py`.
-
-Install Python requirements:
+Run all 22 TPC-H queries and check answers against reference files using `bench/e2e.py`:
 
 ```bash
-pip install -r bench/requirements.txt
+python bench/e2e.py --data /path/to/data/sf1 --refs bench/refs/sf1 --threads 16
 ```
 
-Generate tables and reference answers at a specified scale factor (for example, SF 1):
+---
 
-```bash
-python bench/gen_tpch.py --sf 1 --data-dir data/sf1 --refs-dir bench/refs/sf1
-```
+## Documentation
 
-This command:
-1. Generates 8 TPC-H tables (`customer`, `lineitem`, `nation`, `orders`, `part`, `partsupp`, `region`, `supplier`) and exports each as a Parquet file to the target data directory.
-2. Extracts standard SQL query files into `queries/tpch/` (`q01.sql` through `q22.sql`).
-3. Executes each query against DuckDB and writes the expected answer as CSV to the references directory.
-4. For SF 1, validates each generated answer against DuckDB's internal `tpch_answers()`.
-5. Writes a `MANIFEST.json` containing table row counts and SHA-256 checksums for Parquet files and reference CSV files.
+- [Design Overview](docs/design.md): System architecture, execution model, and engine trade-offs.
+- [Execution Engine](docs/engine.md): Columnar batch layout, morsel scheduler, operator implementations, and memory management.
+- [SQL Frontend and Optimizer](docs/sql.md): Query parsing, name binding, subquery decorrelation, and rule-based plan optimizations.
+- [Testing Record](docs/testing.md): Workspace test suite, reference checking rules, differential fuzzing runs, and mutation testing results.
 
-## Answer Checker
-
-Query output verification is performed by `bench/check.py`:
-
-```bash
-python bench/check.py <actual.csv> <expected.csv> --query <query_number>
-```
-
-The checker operates under the following rules:
-- Header validation: Verifies column count and case-insensitive header names.
-- Row count validation: Ensures the output has the exact expected number of rows.
-- Data comparison:
-  - Empty strings and `NULL` values are treated as distinct.
-  - Floating-point and decimal values are compared using absolute and relative tolerance: `abs(actual - expected) <= max(0.01, 1e-9 * abs(expected))`.
-  - String values must match exactly.
-- Ordering validation:
-  - Uses the query's leading `ORDER BY` key count (`ORDER_KEY_COUNTS`).
-  - Consecutive rows in the reference output that share the same order keys form a tie group.
-  - Rows across different order keys must follow the strict sorted sequence.
-  - Rows within the same tie group may appear in any order (multiset equality).
-- Exit status: Exits with code `0` on match, or `1` on mismatch with the row index and column detail.
+---
 
 ## Benchmarks
 
-Benchmark measurements will be published only from recorded runs. No preliminary performance numbers are reported.
-
-Every benchmark execution records:
-- Engine name and version (morsel, DuckDB, Polars, DataFusion)
-- Git commit hash
-- Scale factor (SF1, SF10)
-- Worker thread count
-- Query identifier
-- Individual run times across one warm-up run and five timed runs (recording min and median)
-- System hardware specification (CPU model, RAM, operating system, hostname, timestamp)
-
-All published tables and figures will be generated strictly from recorded JSON Lines log files.
+Benchmark results against DuckDB, Polars and DataFusion will be added from recorded runs.

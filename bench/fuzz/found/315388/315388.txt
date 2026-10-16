@@ -1,0 +1,202 @@
+Sort {
+    input: Aggregate {
+        input: Filter {
+            input: Scan {
+                table: "lineitem",
+                columns: [
+                    5,
+                    7,
+                    10,
+                    12,
+                    13,
+                ],
+                table_schema: Schema {
+                    fields: [
+                        Field {
+                            name: "l_orderkey",
+                            dtype: Int64,
+                            nullable: true,
+                        },
+                        Field {
+                            name: "l_partkey",
+                            dtype: Int64,
+                            nullable: true,
+                        },
+                        Field {
+                            name: "l_suppkey",
+                            dtype: Int64,
+                            nullable: true,
+                        },
+                        Field {
+                            name: "l_linenumber",
+                            dtype: Int64,
+                            nullable: true,
+                        },
+                        Field {
+                            name: "l_quantity",
+                            dtype: Decimal {
+                                precision: 15,
+                                scale: 2,
+                            },
+                            nullable: true,
+                        },
+                        Field {
+                            name: "l_extendedprice",
+                            dtype: Decimal {
+                                precision: 15,
+                                scale: 2,
+                            },
+                            nullable: true,
+                        },
+                        Field {
+                            name: "l_discount",
+                            dtype: Decimal {
+                                precision: 15,
+                                scale: 2,
+                            },
+                            nullable: true,
+                        },
+                        Field {
+                            name: "l_tax",
+                            dtype: Decimal {
+                                precision: 15,
+                                scale: 2,
+                            },
+                            nullable: true,
+                        },
+                        Field {
+                            name: "l_returnflag",
+                            dtype: Utf8,
+                            nullable: true,
+                        },
+                        Field {
+                            name: "l_linestatus",
+                            dtype: Utf8,
+                            nullable: true,
+                        },
+                        Field {
+                            name: "l_shipdate",
+                            dtype: Date32,
+                            nullable: true,
+                        },
+                        Field {
+                            name: "l_commitdate",
+                            dtype: Date32,
+                            nullable: true,
+                        },
+                        Field {
+                            name: "l_receiptdate",
+                            dtype: Date32,
+                            nullable: true,
+                        },
+                        Field {
+                            name: "l_shipinstruct",
+                            dtype: Utf8,
+                            nullable: true,
+                        },
+                        Field {
+                            name: "l_shipmode",
+                            dtype: Utf8,
+                            nullable: true,
+                        },
+                        Field {
+                            name: "l_comment",
+                            dtype: Utf8,
+                            nullable: true,
+                        },
+                    ],
+                },
+            },
+            predicate: InList {
+                expr: Column(
+                    4,
+                ),
+                list: [
+                    Utf8(
+                        "COLLECT COD",
+                    ),
+                    Utf8(
+                        "TAKE BACK RETURN",
+                    ),
+                    Utf8(
+                        "DELIVER IN PERSON",
+                    ),
+                ],
+                negated: false,
+            },
+        },
+        group_by: [
+            (
+                Column(
+                    0,
+                ),
+                "l_extendedprice",
+            ),
+        ],
+        aggs: [
+            (
+                AggExpr {
+                    func: Sum,
+                    arg: Some(
+                        Column(
+                            1,
+                        ),
+                    ),
+                },
+                "agg_0",
+            ),
+            (
+                AggExpr {
+                    func: Sum,
+                    arg: Some(
+                        Column(
+                            1,
+                        ),
+                    ),
+                },
+                "agg_1",
+            ),
+            (
+                AggExpr {
+                    func: Avg,
+                    arg: Some(
+                        Column(
+                            0,
+                        ),
+                    ),
+                },
+                "agg_2",
+            ),
+        ],
+    },
+    keys: [
+        SortKey {
+            expr: Column(
+                0,
+            ),
+            asc: true,
+            nulls_first: false,
+        },
+        SortKey {
+            expr: Column(
+                1,
+            ),
+            asc: true,
+            nulls_first: false,
+        },
+        SortKey {
+            expr: Column(
+                2,
+            ),
+            asc: true,
+            nulls_first: false,
+        },
+        SortKey {
+            expr: Column(
+                3,
+            ),
+            asc: true,
+            nulls_first: false,
+        },
+    ],
+}

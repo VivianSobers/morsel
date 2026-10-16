@@ -1,0 +1,229 @@
+Limit {
+    input: Sort {
+        input: Aggregate {
+            input: Project {
+                input: Join {
+                    left: Scan {
+                        table: "customer",
+                        columns: [
+                            0,
+                            4,
+                            6,
+                        ],
+                        table_schema: Schema {
+                            fields: [
+                                Field {
+                                    name: "c_custkey",
+                                    dtype: Int64,
+                                    nullable: true,
+                                },
+                                Field {
+                                    name: "c_name",
+                                    dtype: Utf8,
+                                    nullable: true,
+                                },
+                                Field {
+                                    name: "c_address",
+                                    dtype: Utf8,
+                                    nullable: true,
+                                },
+                                Field {
+                                    name: "c_nationkey",
+                                    dtype: Int32,
+                                    nullable: true,
+                                },
+                                Field {
+                                    name: "c_phone",
+                                    dtype: Utf8,
+                                    nullable: true,
+                                },
+                                Field {
+                                    name: "c_acctbal",
+                                    dtype: Decimal {
+                                        precision: 15,
+                                        scale: 2,
+                                    },
+                                    nullable: true,
+                                },
+                                Field {
+                                    name: "c_mktsegment",
+                                    dtype: Utf8,
+                                    nullable: true,
+                                },
+                                Field {
+                                    name: "c_comment",
+                                    dtype: Utf8,
+                                    nullable: true,
+                                },
+                            ],
+                        },
+                    },
+                    right: Scan {
+                        table: "orders",
+                        columns: [
+                            1,
+                            3,
+                            4,
+                        ],
+                        table_schema: Schema {
+                            fields: [
+                                Field {
+                                    name: "o_orderkey",
+                                    dtype: Int64,
+                                    nullable: true,
+                                },
+                                Field {
+                                    name: "o_custkey",
+                                    dtype: Int64,
+                                    nullable: true,
+                                },
+                                Field {
+                                    name: "o_orderstatus",
+                                    dtype: Utf8,
+                                    nullable: true,
+                                },
+                                Field {
+                                    name: "o_totalprice",
+                                    dtype: Decimal {
+                                        precision: 15,
+                                        scale: 2,
+                                    },
+                                    nullable: true,
+                                },
+                                Field {
+                                    name: "o_orderdate",
+                                    dtype: Date32,
+                                    nullable: true,
+                                },
+                                Field {
+                                    name: "o_orderpriority",
+                                    dtype: Utf8,
+                                    nullable: true,
+                                },
+                                Field {
+                                    name: "o_clerk",
+                                    dtype: Utf8,
+                                    nullable: true,
+                                },
+                                Field {
+                                    name: "o_shippriority",
+                                    dtype: Int32,
+                                    nullable: true,
+                                },
+                                Field {
+                                    name: "o_comment",
+                                    dtype: Utf8,
+                                    nullable: true,
+                                },
+                            ],
+                        },
+                    },
+                    join_type: Left,
+                    on: [
+                        (
+                            Column(
+                                0,
+                            ),
+                            Column(
+                                0,
+                            ),
+                        ),
+                    ],
+                    filter: None,
+                },
+                exprs: [
+                    (
+                        Column(
+                            0,
+                        ),
+                        "c_custkey",
+                    ),
+                    (
+                        Column(
+                            1,
+                        ),
+                        "c_phone",
+                    ),
+                    (
+                        Column(
+                            2,
+                        ),
+                        "c_mktsegment",
+                    ),
+                    (
+                        Binary {
+                            op: Add,
+                            left: Column(
+                                3,
+                            ),
+                            right: Column(
+                                3,
+                            ),
+                        },
+                        "calc_0",
+                    ),
+                    (
+                        Extract {
+                            field: Year,
+                            expr: Column(
+                                5,
+                            ),
+                        },
+                        "year_1",
+                    ),
+                ],
+            },
+            group_by: [
+                (
+                    Column(
+                        2,
+                    ),
+                    "c_mktsegment",
+                ),
+                (
+                    Column(
+                        4,
+                    ),
+                    "year_1",
+                ),
+            ],
+            aggs: [
+                (
+                    AggExpr {
+                        func: Min,
+                        arg: Some(
+                            Column(
+                                2,
+                            ),
+                        ),
+                    },
+                    "agg_0",
+                ),
+            ],
+        },
+        keys: [
+            SortKey {
+                expr: Column(
+                    0,
+                ),
+                asc: true,
+                nulls_first: false,
+            },
+            SortKey {
+                expr: Column(
+                    1,
+                ),
+                asc: true,
+                nulls_first: false,
+            },
+            SortKey {
+                expr: Column(
+                    2,
+                ),
+                asc: true,
+                nulls_first: false,
+            },
+        ],
+    },
+    n: 20,
+}
