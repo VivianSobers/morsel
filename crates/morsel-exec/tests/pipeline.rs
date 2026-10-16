@@ -263,3 +263,64 @@ fn project_over_aggregate() {
     assert_eq!(res[0].schema.fields[0].name, "sum_val");
     assert_eq!(res[0].schema.fields[1].name, "id");
 }
+
+#[test]
+fn test_worker_panic_reported() {
+    let schema = Arc::new(Schema {
+        fields: vec![Field {
+            name: "id".to_string(),
+            dtype: DataType::Int32,
+            nullable: false,
+        }],
+    });
+    let table = Table {
+        schema: Arc::clone(&schema),
+        batches: vec![Batch::new(
+            Arc::clone(&schema),
+            vec![Arc::new(Column::from_scalars(
+                DataType::Int32,
+                &[Scalar::Int32(1)],
+            ))],
+        )],
+        rows: 1,
+    };
+    let mut tables = HashMap::new();
+    let table_schema = (*table.schema).clone();
+    tables.insert("t".to_string(), table);
+    let catalog = Catalog { tables };
+
+    let panic_expr = Expr::Substring {
+        expr: Box::new(Expr::Column(0)),
+        start: 1,
+        len: 1,
+    };
+    let agg = LogicalPlan::Aggregate {
+        input: Box::new(LogicalPlan::Scan {
+            table: "t".to_string(),
+            columns: vec![0],
+            table_schema,
+        }),
+        group_by: vec![],
+        aggs: vec![(
+            morsel_plan::AggExpr {
+                func: morsel_plan::AggFunc::Count,
+                arg: Some(panic_expr),
+            },
+            "cnt".to_string(),
+        )],
+    };
+
+    let res = execute(&agg, &catalog, 2);
+    assert!(res.is_err(), "execute should return Err on worker panic");
+    let err_msg = res.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("Column is not Utf8"),
+        "error should contain panic message, got: {}",
+        err_msg
+    );
+    assert!(
+        err_msg.contains("Aggregate"),
+        "error should contain operator name, got: {}",
+        err_msg
+    );
+}

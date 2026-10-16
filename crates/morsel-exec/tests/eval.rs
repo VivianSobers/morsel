@@ -825,3 +825,166 @@ fn case_differing_branch_types() {
     assert_eq!(res.get(0), Scalar::Int64(1));
     assert_eq!(res.get(1), Scalar::Int64(10_000_000_000));
 }
+
+#[test]
+fn like_multiline_and_escapes() {
+    let schema = Arc::new(Schema {
+        fields: vec![Field {
+            name: "s".to_string(),
+            dtype: DataType::Utf8,
+            nullable: false,
+        }],
+    });
+    let batch = Batch::new(
+        schema,
+        vec![Arc::new(Column::from_scalars(
+            DataType::Utf8,
+            &[
+                Scalar::Utf8("hello\nworld".to_string()),
+                Scalar::Utf8("100% discount".to_string()),
+                Scalar::Utf8("a_b".to_string()),
+            ],
+        ))],
+    );
+
+    let like_multi = Expr::Like {
+        expr: Box::new(Expr::Column(0)),
+        pattern: "%world".to_string(),
+        negated: false,
+    };
+    let res = eval(&like_multi, &batch).unwrap();
+    assert_eq!(res.get(0), Scalar::Bool(true));
+
+    let like_esc_pct = Expr::Like {
+        expr: Box::new(Expr::Column(0)),
+        pattern: r"100\% discount".to_string(),
+        negated: false,
+    };
+    let res = eval(&like_esc_pct, &batch).unwrap();
+    assert_eq!(res.get(1), Scalar::Bool(true));
+
+    let like_esc_underscore = Expr::Like {
+        expr: Box::new(Expr::Column(0)),
+        pattern: r"a\_b".to_string(),
+        negated: false,
+    };
+    let res = eval(&like_esc_underscore, &batch).unwrap();
+    assert_eq!(res.get(2), Scalar::Bool(true));
+}
+
+#[test]
+fn div_by_zero_returns_null() {
+    let schema = Arc::new(Schema {
+        fields: vec![
+            Field {
+                name: "a".to_string(),
+                dtype: DataType::Float64,
+                nullable: false,
+            },
+            Field {
+                name: "b".to_string(),
+                dtype: DataType::Float64,
+                nullable: false,
+            },
+        ],
+    });
+    let batch = Batch::new(
+        schema,
+        vec![
+            Arc::new(Column::from_scalars(
+                DataType::Float64,
+                &[Scalar::Float64(10.0), Scalar::Float64(0.0)],
+            )),
+            Arc::new(Column::from_scalars(
+                DataType::Float64,
+                &[Scalar::Float64(0.0), Scalar::Float64(0.0)],
+            )),
+        ],
+    );
+    let div_expr = Expr::Binary {
+        op: BinOp::Div,
+        left: Box::new(Expr::Column(0)),
+        right: Box::new(Expr::Column(1)),
+    };
+    let res = eval(&div_expr, &batch).unwrap();
+    assert_eq!(res.dtype, DataType::Float64);
+    assert_eq!(res.get(0), Scalar::Null);
+    assert_eq!(res.get(1), Scalar::Null);
+    assert!(res.is_null(0));
+    assert!(res.is_null(1));
+}
+
+#[test]
+fn nan_comparison_is_false() {
+    let schema = Arc::new(Schema {
+        fields: vec![
+            Field {
+                name: "a".to_string(),
+                dtype: DataType::Float64,
+                nullable: false,
+            },
+            Field {
+                name: "b".to_string(),
+                dtype: DataType::Float64,
+                nullable: false,
+            },
+        ],
+    });
+    let batch = Batch::new(
+        schema,
+        vec![
+            Arc::new(Column::from_scalars(
+                DataType::Float64,
+                &[Scalar::Float64(f64::NAN), Scalar::Float64(f64::NAN)],
+            )),
+            Arc::new(Column::from_scalars(
+                DataType::Float64,
+                &[Scalar::Float64(5.0), Scalar::Float64(f64::NAN)],
+            )),
+        ],
+    );
+
+    let eq_expr = Expr::Binary {
+        op: BinOp::Eq,
+        left: Box::new(Expr::Column(0)),
+        right: Box::new(Expr::Column(1)),
+    };
+    let res = eval(&eq_expr, &batch).unwrap();
+    assert_eq!(res.get(0), Scalar::Bool(false));
+    assert_eq!(res.get(1), Scalar::Bool(false));
+
+    let neq_expr = Expr::Binary {
+        op: BinOp::NotEq,
+        left: Box::new(Expr::Column(0)),
+        right: Box::new(Expr::Column(1)),
+    };
+    let res = eval(&neq_expr, &batch).unwrap();
+    assert_eq!(res.get(0), Scalar::Bool(true));
+    assert_eq!(res.get(1), Scalar::Bool(true));
+
+    let lt_expr = Expr::Binary {
+        op: BinOp::Lt,
+        left: Box::new(Expr::Column(0)),
+        right: Box::new(Expr::Column(1)),
+    };
+    let res = eval(&lt_expr, &batch).unwrap();
+    assert_eq!(res.get(0), Scalar::Bool(false));
+}
+
+#[test]
+fn float64_cross_type_comparisons() {
+    let f = Scalar::Float64(4.9);
+    let dec = Scalar::Decimal(4064928, 2);
+    let int = Scalar::Int32(5);
+
+    assert_eq!(compare_scalars(&f, &dec).unwrap(), std::cmp::Ordering::Less);
+    assert_eq!(
+        compare_scalars(&dec, &f).unwrap(),
+        std::cmp::Ordering::Greater
+    );
+    assert_eq!(compare_scalars(&f, &int).unwrap(), std::cmp::Ordering::Less);
+    assert_eq!(
+        compare_scalars(&int, &f).unwrap(),
+        std::cmp::Ordering::Greater
+    );
+}

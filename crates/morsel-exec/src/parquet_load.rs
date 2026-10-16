@@ -55,7 +55,7 @@ pub fn load_parquet_dir_impl(dir: &Path, threads: usize) -> Result<Catalog> {
     Ok(Catalog { tables })
 }
 
-fn convert_arrow_schema(arrow_schema: &ArrowSchema) -> Result<Schema> {
+pub fn convert_arrow_schema(arrow_schema: &ArrowSchema) -> Result<Schema> {
     let mut fields = Vec::with_capacity(arrow_schema.fields().len());
     for f in arrow_schema.fields() {
         let name = f.name().clone();
@@ -65,10 +65,19 @@ fn convert_arrow_schema(arrow_schema: &ArrowSchema) -> Result<Schema> {
             ArrowType::Int32 => DataType::Int32,
             ArrowType::Int64 => DataType::Int64,
             ArrowType::Float64 => DataType::Float64,
-            ArrowType::Decimal128(p, s) => DataType::Decimal {
-                precision: *p,
-                scale: *s as u8,
-            },
+            ArrowType::Decimal128(p, s) => {
+                if *s < 0 {
+                    bail!(
+                        "unsupported negative scale {} in Decimal128 for column '{}'",
+                        s,
+                        f.name()
+                    );
+                }
+                DataType::Decimal {
+                    precision: *p,
+                    scale: *s as u8,
+                }
+            }
             ArrowType::Date32 => DataType::Date32,
             ArrowType::Utf8 | ArrowType::LargeUtf8 => DataType::Utf8,
             other => bail!(

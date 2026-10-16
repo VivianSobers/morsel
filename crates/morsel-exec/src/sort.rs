@@ -219,10 +219,22 @@ pub fn execute_sort(
                     })
                 })
                 .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().unwrap())
-                .collect::<Vec<_>>()
+            let mut worker_panic = None;
+            let mut results = Vec::with_capacity(handles.len());
+            for h in handles {
+                match h.join() {
+                    Ok(res) => results.push(res),
+                    Err(payload) => {
+                        if worker_panic.is_none() {
+                            worker_panic = Some(payload);
+                        }
+                    }
+                }
+            }
+            if let Some(payload) = worker_panic {
+                std::panic::resume_unwind(payload);
+            }
+            results
         });
 
         if let Some(err) = error_cell.into_inner().unwrap() {
@@ -300,10 +312,22 @@ pub fn execute_sort(
                 })
             })
             .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().unwrap())
-            .collect::<Vec<_>>()
+        let mut worker_panic = None;
+        let mut results = Vec::with_capacity(handles.len());
+        for h in handles {
+            match h.join() {
+                Ok(res) => results.push(res),
+                Err(payload) => {
+                    if worker_panic.is_none() {
+                        worker_panic = Some(payload);
+                    }
+                }
+            }
+        }
+        if let Some(payload) = worker_panic {
+            std::panic::resume_unwind(payload);
+        }
+        results
     });
 
     if let Some(err) = error_cell.into_inner().unwrap() {
@@ -336,7 +360,7 @@ pub fn execute_sort(
         for (col_idx, val) in item.row.values.iter().enumerate() {
             cur_cols[col_idx].push(val.clone());
         }
-        if cur_cols[0].len() >= BATCH_ROWS {
+        if !cur_cols.is_empty() && cur_cols[0].len() >= BATCH_ROWS {
             let mut cols = Vec::with_capacity(num_cols);
             for (i, field) in schema.fields.iter().enumerate() {
                 let col = Column::from_scalars(field.dtype, &cur_cols[i]);
