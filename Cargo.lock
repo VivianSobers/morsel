@@ -816,6 +816,7 @@ dependencies = [
  "chrono",
  "morsel-core",
  "morsel-plan",
+ "regex",
  "sqlparser",
 ]
 

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use anyhow::{anyhow, bail, Result};
 use morsel_core::Schema;
@@ -56,8 +56,14 @@ pub fn contains_subquery(expr: &sql::Expr) -> bool {
     }
 }
 
-pub(crate) fn get_subquery_tables(query: &sql::Query) -> HashSet<String> {
-    let mut tables = HashSet::new();
+#[derive(Clone, Debug)]
+pub(crate) struct InnerTableInfo {
+    pub alias: String,
+    pub real_table: Option<String>,
+}
+
+pub(crate) fn get_subquery_tables(query: &sql::Query) -> Vec<InnerTableInfo> {
+    let mut tables = Vec::new();
     if let sql::SetExpr::Select(select) = &*query.body {
         for twj in &select.from {
             add_factor_tables(&twj.relation, &mut tables);
@@ -69,17 +75,24 @@ pub(crate) fn get_subquery_tables(query: &sql::Query) -> HashSet<String> {
     tables
 }
 
-fn add_factor_tables(factor: &sql::TableFactor, tables: &mut HashSet<String>) {
+fn add_factor_tables(factor: &sql::TableFactor, tables: &mut Vec<InnerTableInfo>) {
     match factor {
         sql::TableFactor::Table { name, alias, .. } => {
-            if let Some(a) = alias {
-                tables.insert(a.name.value.to_lowercase());
-            } else {
-                tables.insert(name.to_string().to_lowercase());
-            }
+            let real = name.to_string();
+            let alias_str = alias
+                .as_ref()
+                .map(|a| a.name.value.clone())
+                .unwrap_or_else(|| real.clone());
+            tables.push(InnerTableInfo {
+                alias: alias_str.to_lowercase(),
+                real_table: Some(real),
+            });
         }
         sql::TableFactor::Derived { alias: Some(a), .. } => {
-            tables.insert(a.name.value.to_lowercase());
+            tables.push(InnerTableInfo {
+                alias: a.name.value.to_lowercase(),
+                real_table: None,
+            });
         }
         sql::TableFactor::Derived { alias: None, .. } => {}
         sql::TableFactor::NestedJoin {
@@ -96,14 +109,15 @@ fn add_factor_tables(factor: &sql::TableFactor, tables: &mut HashSet<String>) {
 
 pub(crate) fn contains_outer_ref(
     expr: &sql::Expr,
-    inner_tables: &HashSet<String>,
+    inner_tables: &[InnerTableInfo],
     outer_scope: &QueryScope,
+    schemas: &dyn SchemaProvider,
 ) -> bool {
     match expr {
         sql::Expr::CompoundIdentifier(parts) => {
             if parts.len() == 2 {
                 let tbl = parts[0].value.to_lowercase();
-                if inner_tables.contains(&tbl) {
+                if inner_tables.iter().any(|t| t.alias == tbl) {
                     return false;
                 }
                 for t in &outer_scope.tables {
@@ -120,19 +134,31 @@ pub(crate) fn contains_outer_ref(
         }
         sql::Expr::Identifier(ident) => {
             let col = &ident.value;
+            let found_in_inner = inner_tables.iter().any(|t| {
+                if let Some(real) = &t.real_table {
+                    if let Some(schema) = schemas.table_schema(real) {
+                        return schema.index_of(col).is_some();
+                    }
+                }
+                false
+            });
+            if found_in_inner {
+                return false;
+            }
             let found_in_outer = outer_scope
                 .tables
                 .iter()
                 .any(|t| t.full_schema.index_of(col).is_some());
-            let found_in_inner = false; // By precedence, if unqualified and found in inner, not outer
-            found_in_outer && !found_in_inner
+            found_in_outer
         }
         sql::Expr::BinaryOp { left, right, .. } => {
-            contains_outer_ref(left, inner_tables, outer_scope)
-                || contains_outer_ref(right, inner_tables, outer_scope)
+            contains_outer_ref(left, inner_tables, outer_scope, schemas)
+                || contains_outer_ref(right, inner_tables, outer_scope, schemas)
         }
-        sql::Expr::UnaryOp { expr, .. } => contains_outer_ref(expr, inner_tables, outer_scope),
-        sql::Expr::Nested(inner) => contains_outer_ref(inner, inner_tables, outer_scope),
+        sql::Expr::UnaryOp { expr, .. } => {
+            contains_outer_ref(expr, inner_tables, outer_scope, schemas)
+        }
+        sql::Expr::Nested(inner) => contains_outer_ref(inner, inner_tables, outer_scope, schemas),
         _ => false,
     }
 }
@@ -185,8 +211,10 @@ pub(crate) fn decorrelate_where(
 
                 for sc in sub_conjuncts {
                     if let sql::Expr::BinaryOp { left, op, right } = &sc {
-                        let left_outer = contains_outer_ref(left, &inner_tables, outer_scope);
-                        let right_outer = contains_outer_ref(right, &inner_tables, outer_scope);
+                        let left_outer =
+                            contains_outer_ref(left, &inner_tables, outer_scope, schemas);
+                        let right_outer =
+                            contains_outer_ref(right, &inner_tables, outer_scope, schemas);
 
                         if left_outer && !right_outer {
                             if *op == sql::BinaryOperator::Eq {
@@ -205,7 +233,7 @@ pub(crate) fn decorrelate_where(
                         }
                     }
 
-                    if contains_outer_ref(&sc, &inner_tables, outer_scope) {
+                    if contains_outer_ref(&sc, &inner_tables, outer_scope, schemas) {
                         residual_filters.push(sc);
                     } else {
                         inner_filter_conjuncts.push(sc);
@@ -247,7 +275,7 @@ pub(crate) fn decorrelate_where(
                     for rf in residual_filters {
                         if let sql::Expr::BinaryOp { left, op, right } = rf {
                             let left_is_outer =
-                                contains_outer_ref(&left, &inner_tables, outer_scope);
+                                contains_outer_ref(&left, &inner_tables, outer_scope, schemas);
                             let (out_e, in_e) = if left_is_outer {
                                 (*left, *right)
                             } else {
@@ -370,8 +398,10 @@ pub(crate) fn decorrelate_where(
                             right,
                         } = &sc
                         {
-                            let left_outer = contains_outer_ref(left, &inner_tables, outer_scope);
-                            let right_outer = contains_outer_ref(right, &inner_tables, outer_scope);
+                            let left_outer =
+                                contains_outer_ref(left, &inner_tables, outer_scope, schemas);
+                            let right_outer =
+                                contains_outer_ref(right, &inner_tables, outer_scope, schemas);
                             if left_outer && !right_outer {
                                 equi_on.push((*left.clone(), *right.clone()));
                                 continue;
@@ -380,7 +410,7 @@ pub(crate) fn decorrelate_where(
                                 continue;
                             }
                         }
-                        if !contains_outer_ref(&sc, &inner_tables, outer_scope) {
+                        if !contains_outer_ref(&sc, &inner_tables, outer_scope, schemas) {
                             inner_filter_conjuncts.push(sc);
                         }
                     }
@@ -496,4 +526,89 @@ pub(crate) fn decorrelate_where(
     };
 
     Ok((current_plan, final_predicate))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decorrelate_having(
+    having: &sql::Expr,
+    mut cur_plan: LogicalPlan,
+    group_exprs: &[(Expr, String)],
+    aggs: &[(morsel_plan::AggFunc, Option<sql::Expr>, String)],
+    binder_ctx: &crate::bind::ExprBinderContext,
+    schemas: &dyn SchemaProvider,
+    ctes: &HashMap<String, sql::Query>,
+) -> Result<LogicalPlan> {
+    let conjuncts = split_conjuncts(having);
+    let mut bound_conjuncts = Vec::new();
+
+    for conjunct in conjuncts {
+        if let sql::Expr::BinaryOp { left, op, right } = &conjunct {
+            let left_has_sub = contains_subquery(left);
+            let right_has_sub = contains_subquery(right);
+
+            if left_has_sub || right_has_sub {
+                let (subquery_expr, other_expr, sub_is_right) = if right_has_sub {
+                    (right.as_ref(), left.as_ref(), true)
+                } else {
+                    (left.as_ref(), right.as_ref(), false)
+                };
+
+                let subquery = match subquery_expr {
+                    sql::Expr::Subquery(q) => q,
+                    sql::Expr::Nested(inner) => match &**inner {
+                        sql::Expr::Subquery(q) => q,
+                        _ => bail!("unsupported subquery in HAVING: {:?}", subquery_expr),
+                    },
+                    _ => bail!("unsupported subquery in HAVING: {:?}", subquery_expr),
+                };
+
+                let sub_plan = bind_query(subquery, schemas, ctes)?;
+                let left_len = cur_plan.schema()?.len();
+                cur_plan = LogicalPlan::CrossJoin {
+                    left: Box::new(cur_plan),
+                    right: Box::new(sub_plan),
+                };
+
+                let b_other =
+                    crate::bind::rewrite_post_agg_expr(other_expr, group_exprs, aggs, binder_ctx)?;
+                let sub_col = Expr::Column(left_len);
+                let bin_op = crate::bind::map_bin_op(op)?;
+                let (final_l, final_r) = if sub_is_right {
+                    (b_other, sub_col)
+                } else {
+                    (sub_col, b_other)
+                };
+                let cur_schema = cur_plan.schema()?;
+                let (final_l, final_r) =
+                    crate::bind::coerce_for_cmp(final_l, final_r, &cur_schema)?;
+                bound_conjuncts.push(Expr::Binary {
+                    op: bin_op,
+                    left: Box::new(final_l),
+                    right: Box::new(final_r),
+                });
+                continue;
+            }
+        }
+
+        let bound = crate::bind::rewrite_post_agg_expr(&conjunct, group_exprs, aggs, binder_ctx)?;
+        bound_conjuncts.push(bound);
+    }
+
+    if !bound_conjuncts.is_empty() {
+        let mut iter = bound_conjuncts.into_iter();
+        let mut root = iter.next().unwrap();
+        for next in iter {
+            root = Expr::Binary {
+                op: BinOp::And,
+                left: Box::new(root),
+                right: Box::new(next),
+            };
+        }
+        cur_plan = LogicalPlan::Filter {
+            input: Box::new(cur_plan),
+            predicate: root,
+        };
+    }
+
+    Ok(cur_plan)
 }

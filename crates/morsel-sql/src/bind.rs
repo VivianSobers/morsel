@@ -133,11 +133,12 @@ fn collect_used_columns_from_expr(
     expr: &sql::Expr,
     scope: &mut QueryScope,
     select_aliases: &HashMap<String, &sql::Expr>,
+    schemas: &dyn SchemaProvider,
 ) -> Result<()> {
     match expr {
         sql::Expr::Identifier(ident) => {
             if let Some(alias_expr) = select_aliases.get(&ident.value.to_lowercase()) {
-                collect_used_columns_from_expr(alias_expr, scope, select_aliases)?;
+                collect_used_columns_from_expr(alias_expr, scope, select_aliases, schemas)?;
             } else {
                 scope.mark_column_used(None, &ident.value)?;
             }
@@ -148,30 +149,30 @@ fn collect_used_columns_from_expr(
             }
         }
         sql::Expr::BinaryOp { left, right, .. } => {
-            collect_used_columns_from_expr(left, scope, select_aliases)?;
-            collect_used_columns_from_expr(right, scope, select_aliases)?;
+            collect_used_columns_from_expr(left, scope, select_aliases, schemas)?;
+            collect_used_columns_from_expr(right, scope, select_aliases, schemas)?;
         }
         sql::Expr::UnaryOp { expr, .. } => {
-            collect_used_columns_from_expr(expr, scope, select_aliases)?;
+            collect_used_columns_from_expr(expr, scope, select_aliases, schemas)?;
         }
         sql::Expr::Between {
             expr, low, high, ..
         } => {
-            collect_used_columns_from_expr(expr, scope, select_aliases)?;
-            collect_used_columns_from_expr(low, scope, select_aliases)?;
-            collect_used_columns_from_expr(high, scope, select_aliases)?;
+            collect_used_columns_from_expr(expr, scope, select_aliases, schemas)?;
+            collect_used_columns_from_expr(low, scope, select_aliases, schemas)?;
+            collect_used_columns_from_expr(high, scope, select_aliases, schemas)?;
         }
         sql::Expr::IsNull(expr) | sql::Expr::IsNotNull(expr) => {
-            collect_used_columns_from_expr(expr, scope, select_aliases)?;
+            collect_used_columns_from_expr(expr, scope, select_aliases, schemas)?;
         }
         sql::Expr::Like { expr, pattern, .. } => {
-            collect_used_columns_from_expr(expr, scope, select_aliases)?;
-            collect_used_columns_from_expr(pattern, scope, select_aliases)?;
+            collect_used_columns_from_expr(expr, scope, select_aliases, schemas)?;
+            collect_used_columns_from_expr(pattern, scope, select_aliases, schemas)?;
         }
         sql::Expr::InList { expr, list, .. } => {
-            collect_used_columns_from_expr(expr, scope, select_aliases)?;
+            collect_used_columns_from_expr(expr, scope, select_aliases, schemas)?;
             for item in list {
-                collect_used_columns_from_expr(item, scope, select_aliases)?;
+                collect_used_columns_from_expr(item, scope, select_aliases, schemas)?;
             }
         }
         sql::Expr::Case {
@@ -181,23 +182,23 @@ fn collect_used_columns_from_expr(
             else_result,
         } => {
             if let Some(op) = operand {
-                collect_used_columns_from_expr(op, scope, select_aliases)?;
+                collect_used_columns_from_expr(op, scope, select_aliases, schemas)?;
             }
             for cond in conditions {
-                collect_used_columns_from_expr(cond, scope, select_aliases)?;
+                collect_used_columns_from_expr(cond, scope, select_aliases, schemas)?;
             }
             for res in results {
-                collect_used_columns_from_expr(res, scope, select_aliases)?;
+                collect_used_columns_from_expr(res, scope, select_aliases, schemas)?;
             }
             if let Some(el) = else_result {
-                collect_used_columns_from_expr(el, scope, select_aliases)?;
+                collect_used_columns_from_expr(el, scope, select_aliases, schemas)?;
             }
         }
         sql::Expr::Cast { expr, .. } => {
-            collect_used_columns_from_expr(expr, scope, select_aliases)?;
+            collect_used_columns_from_expr(expr, scope, select_aliases, schemas)?;
         }
         sql::Expr::Extract { expr, .. } => {
-            collect_used_columns_from_expr(expr, scope, select_aliases)?;
+            collect_used_columns_from_expr(expr, scope, select_aliases, schemas)?;
         }
         sql::Expr::Substring {
             expr,
@@ -205,45 +206,49 @@ fn collect_used_columns_from_expr(
             substring_for,
             ..
         } => {
-            collect_used_columns_from_expr(expr, scope, select_aliases)?;
+            collect_used_columns_from_expr(expr, scope, select_aliases, schemas)?;
             if let Some(f) = substring_from {
-                collect_used_columns_from_expr(f, scope, select_aliases)?;
+                collect_used_columns_from_expr(f, scope, select_aliases, schemas)?;
             }
             if let Some(f) = substring_for {
-                collect_used_columns_from_expr(f, scope, select_aliases)?;
+                collect_used_columns_from_expr(f, scope, select_aliases, schemas)?;
             }
         }
         sql::Expr::Function(func) => {
             let (args, _) = get_function_args(func);
             for arg in args {
                 if let sql::FunctionArg::Unnamed(sql::FunctionArgExpr::Expr(e)) = arg {
-                    collect_used_columns_from_expr(e, scope, select_aliases)?;
+                    collect_used_columns_from_expr(e, scope, select_aliases, schemas)?;
                 }
             }
         }
         sql::Expr::Nested(inner) => {
-            collect_used_columns_from_expr(inner, scope, select_aliases)?;
+            collect_used_columns_from_expr(inner, scope, select_aliases, schemas)?;
         }
         sql::Expr::Exists { subquery, .. } => {
-            collect_outer_columns_from_query(subquery, scope)?;
+            collect_outer_columns_from_query(subquery, scope, schemas)?;
         }
         sql::Expr::InSubquery { expr, subquery, .. } => {
-            collect_used_columns_from_expr(expr, scope, select_aliases)?;
-            collect_outer_columns_from_query(subquery, scope)?;
+            collect_used_columns_from_expr(expr, scope, select_aliases, schemas)?;
+            collect_outer_columns_from_query(subquery, scope, schemas)?;
         }
         sql::Expr::Subquery(subquery) => {
-            collect_outer_columns_from_query(subquery, scope)?;
+            collect_outer_columns_from_query(subquery, scope, schemas)?;
         }
         _ => {}
     }
     Ok(())
 }
 
-fn collect_outer_columns_from_query(query: &sql::Query, scope: &mut QueryScope) -> Result<()> {
+fn collect_outer_columns_from_query(
+    query: &sql::Query,
+    scope: &mut QueryScope,
+    schemas: &dyn SchemaProvider,
+) -> Result<()> {
     let inner_tables = crate::subquery::get_subquery_tables(query);
     if let sql::SetExpr::Select(select) = &*query.body {
         if let Some(selection) = &select.selection {
-            collect_outer_from_expr(selection, &inner_tables, scope)?;
+            collect_outer_from_expr(selection, &inner_tables, scope, schemas)?;
         }
     }
     Ok(())
@@ -251,14 +256,15 @@ fn collect_outer_columns_from_query(query: &sql::Query, scope: &mut QueryScope) 
 
 fn collect_outer_from_expr(
     expr: &sql::Expr,
-    inner_tables: &HashSet<String>,
+    inner_tables: &[crate::subquery::InnerTableInfo],
     scope: &mut QueryScope,
+    schemas: &dyn SchemaProvider,
 ) -> Result<()> {
     match expr {
         sql::Expr::CompoundIdentifier(parts) => {
             if parts.len() == 2 {
                 let tbl = parts[0].value.to_lowercase();
-                if !inner_tables.contains(&tbl) {
+                if !inner_tables.iter().any(|t| t.alias == tbl) {
                     scope
                         .mark_column_used(Some(&parts[0].value), &parts[1].value)
                         .ok();
@@ -267,23 +273,33 @@ fn collect_outer_from_expr(
         }
         sql::Expr::Identifier(ident) => {
             let col = &ident.value;
-            let found_in_outer = scope
-                .tables
-                .iter()
-                .any(|t| t.full_schema.index_of(col).is_some());
-            if found_in_outer {
-                scope.mark_column_used(None, col).ok();
+            let found_in_inner = inner_tables.iter().any(|t| {
+                if let Some(real) = &t.real_table {
+                    if let Some(schema) = schemas.table_schema(real) {
+                        return schema.index_of(col).is_some();
+                    }
+                }
+                false
+            });
+            if !found_in_inner {
+                let found_in_outer = scope
+                    .tables
+                    .iter()
+                    .any(|t| t.full_schema.index_of(col).is_some());
+                if found_in_outer {
+                    scope.mark_column_used(None, col).ok();
+                }
             }
         }
         sql::Expr::BinaryOp { left, right, .. } => {
-            collect_outer_from_expr(left, inner_tables, scope)?;
-            collect_outer_from_expr(right, inner_tables, scope)?;
+            collect_outer_from_expr(left, inner_tables, scope, schemas)?;
+            collect_outer_from_expr(right, inner_tables, scope, schemas)?;
         }
         sql::Expr::UnaryOp { expr, .. } => {
-            collect_outer_from_expr(expr, inner_tables, scope)?;
+            collect_outer_from_expr(expr, inner_tables, scope, schemas)?;
         }
         sql::Expr::Nested(inner) => {
-            collect_outer_from_expr(inner, inner_tables, scope)?;
+            collect_outer_from_expr(inner, inner_tables, scope, schemas)?;
         }
         _ => {}
     }
@@ -315,7 +331,7 @@ fn bind_select(
     for item in &select.projection {
         match item {
             sql::SelectItem::UnnamedExpr(expr) | sql::SelectItem::ExprWithAlias { expr, .. } => {
-                collect_used_columns_from_expr(expr, &mut scope, &select_aliases)?;
+                collect_used_columns_from_expr(expr, &mut scope, &select_aliases, schemas)?;
             }
             sql::SelectItem::Wildcard(_) => {
                 scope.mark_all_columns_used(None)?;
@@ -328,25 +344,25 @@ fn bind_select(
     }
 
     if let Some(selection) = &select.selection {
-        collect_used_columns_from_expr(selection, &mut scope, &select_aliases)?;
+        collect_used_columns_from_expr(selection, &mut scope, &select_aliases, schemas)?;
     }
 
     match &select.group_by {
         sql::GroupByExpr::Expressions(exprs, _) => {
             for expr in exprs {
-                collect_used_columns_from_expr(expr, &mut scope, &select_aliases)?;
+                collect_used_columns_from_expr(expr, &mut scope, &select_aliases, schemas)?;
             }
         }
         sql::GroupByExpr::All(_) => {}
     }
 
     if let Some(having) = &select.having {
-        collect_used_columns_from_expr(having, &mut scope, &select_aliases)?;
+        collect_used_columns_from_expr(having, &mut scope, &select_aliases, schemas)?;
     }
 
     if let Some(order_by) = &query.order_by {
         for order_expr in &order_by.exprs {
-            collect_used_columns_from_expr(&order_expr.expr, &mut scope, &select_aliases)?;
+            collect_used_columns_from_expr(&order_expr.expr, &mut scope, &select_aliases, schemas)?;
         }
     }
 
@@ -355,7 +371,7 @@ fn bind_select(
             match &join.join_operator {
                 sql::JoinOperator::Inner(sql::JoinConstraint::On(expr))
                 | sql::JoinOperator::LeftOuter(sql::JoinConstraint::On(expr)) => {
-                    collect_used_columns_from_expr(expr, &mut scope, &select_aliases)?;
+                    collect_used_columns_from_expr(expr, &mut scope, &select_aliases, schemas)?;
                 }
                 _ => {}
             }
@@ -614,12 +630,15 @@ fn bind_select(
             let mut cur_plan = agg_plan;
 
             if let Some(having) = &select.having {
-                let having_expr =
-                    rewrite_post_agg_expr(having, &group_exprs, &agg_collector.aggs, &binder_ctx)?;
-                cur_plan = LogicalPlan::Filter {
-                    input: Box::new(cur_plan),
-                    predicate: having_expr,
-                };
+                cur_plan = crate::subquery::decorrelate_having(
+                    having,
+                    cur_plan,
+                    &group_exprs,
+                    &agg_collector.aggs,
+                    &binder_ctx,
+                    schemas,
+                    ctes,
+                )?;
             }
 
             let is_identity = final_proj.len() == agg_schema.len()
@@ -1570,7 +1589,7 @@ impl AggCollector {
     }
 }
 
-fn rewrite_post_agg_expr(
+pub(crate) fn rewrite_post_agg_expr(
     expr: &sql::Expr,
     group_by: &[(Expr, String)],
     aggs: &[(AggFunc, Option<sql::Expr>, String)],

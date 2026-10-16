@@ -9,3 +9,4 @@ morsel-plan = { path = "../morsel-plan" }
 sqlparser = "0.54"
 anyhow = "1.0"
 chrono = "0.4"
+regex = "1.11"
