@@ -361,6 +361,31 @@ impl AggState {
     }
 }
 
+fn merge_two_maps(
+    base: AHashMap<GroupKey, Vec<AggState>>,
+    other: AHashMap<GroupKey, Vec<AggState>>,
+) -> Result<AHashMap<GroupKey, Vec<AggState>>> {
+    let (mut target, source) = if base.len() >= other.len() {
+        (base, other)
+    } else {
+        (other, base)
+    };
+    for (key, states) in source {
+        match target.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut occ) => {
+                let cur = occ.get_mut();
+                for (i, st) in states.into_iter().enumerate() {
+                    cur[i].merge(st)?;
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(vac) => {
+                vac.insert(states);
+            }
+        }
+    }
+    Ok(target)
+}
+
 pub fn execute_aggregate(
     input: &LogicalPlan,
     group_by: &[(Expr, String)],
@@ -388,7 +413,7 @@ pub fn execute_aggregate(
     let cancelled = AtomicBool::new(false);
     let error_cell = Mutex::new(None);
 
-    let maps = std::thread::scope(|s| {
+    let mut maps = std::thread::scope(|s| {
         let handles: Vec<_> = (0..num_threads)
             .map(|_| {
                 let next_ref = &next_morsel;
@@ -498,23 +523,32 @@ pub fn execute_aggregate(
     if let Some(err) = error_cell.into_inner().unwrap() {
         return Err(err);
     }
-    let mut merged_map: AHashMap<GroupKey, Vec<AggState>> = AHashMap::new();
+    while maps.len() > 1 {
+        let mut pairs = Vec::with_capacity(maps.len() / 2);
+        while maps.len() >= 2 {
+            let m1 = maps.pop().unwrap();
+            let m2 = maps.pop().unwrap();
+            pairs.push((m1, m2));
+        }
+        let remainder = maps.pop();
 
-    for map in maps {
-        for (key, states) in map {
-            match merged_map.entry(key) {
-                std::collections::hash_map::Entry::Occupied(mut occ) => {
-                    let cur = occ.get_mut();
-                    for (i, st) in states.into_iter().enumerate() {
-                        cur[i].merge(st)?;
-                    }
-                }
-                std::collections::hash_map::Entry::Vacant(vac) => {
-                    vac.insert(states);
-                }
+        let merged_pairs: Result<Vec<_>> = std::thread::scope(|s| {
+            let handles: Vec<_> = pairs
+                .into_iter()
+                .map(|(m1, m2)| s.spawn(move || merge_two_maps(m1, m2)))
+                .collect();
+            let mut res = Vec::with_capacity(handles.len());
+            for h in handles {
+                res.push(h.join().unwrap()?);
             }
+            Ok(res)
+        });
+        maps = merged_pairs?;
+        if let Some(rem) = remainder {
+            maps.push(rem);
         }
     }
+    let mut merged_map = maps.pop().unwrap_or_default();
 
     // If global aggregate and input was empty: create one row
     if group_by.is_empty() && merged_map.is_empty() {
