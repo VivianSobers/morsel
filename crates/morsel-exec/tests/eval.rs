@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use morsel_core::{Batch, Column, DataType, Field, Scalar, Schema};
-use morsel_exec::eval::{eval, eval_predicate};
+use morsel_exec::eval::{compare_scalars, eval, eval_predicate};
 use morsel_plan::{BinOp, DateField, Expr};
 
 #[test]
@@ -577,4 +577,124 @@ fn float_mul_decimal() {
     let res = eval(&expr, &batch).unwrap();
     assert_eq!(res.dtype, DataType::Float64);
     assert_eq!(res.get(0), Scalar::Float64(500.0));
+}
+
+#[test]
+fn all_null_batch_preserves_arithmetic_type() {
+    let schema = Arc::new(Schema {
+        fields: vec![
+            Field {
+                name: "a".to_string(),
+                dtype: DataType::Decimal {
+                    precision: 15,
+                    scale: 2,
+                },
+                nullable: true,
+            },
+            Field {
+                name: "b".to_string(),
+                dtype: DataType::Decimal {
+                    precision: 15,
+                    scale: 2,
+                },
+                nullable: true,
+            },
+        ],
+    });
+
+    let batch = Batch::new(
+        schema,
+        vec![
+            Arc::new(Column::from_scalars(
+                DataType::Decimal {
+                    precision: 15,
+                    scale: 2,
+                },
+                &[Scalar::Null],
+            )),
+            Arc::new(Column::from_scalars(
+                DataType::Decimal {
+                    precision: 15,
+                    scale: 2,
+                },
+                &[Scalar::Null],
+            )),
+        ],
+    );
+
+    let expr = Expr::Binary {
+        op: BinOp::Add,
+        left: Box::new(Expr::Column(0)),
+        right: Box::new(Expr::Column(1)),
+    };
+
+    let col = eval(&expr, &batch).unwrap();
+    assert_eq!(
+        col.dtype,
+        DataType::Decimal {
+            precision: 38,
+            scale: 2
+        }
+    );
+}
+
+#[test]
+fn decimal_mul_overflow_returns_error() {
+    let schema = Arc::new(Schema {
+        fields: vec![
+            Field {
+                name: "a".to_string(),
+                dtype: DataType::Decimal {
+                    precision: 38,
+                    scale: 2,
+                },
+                nullable: false,
+            },
+            Field {
+                name: "b".to_string(),
+                dtype: DataType::Decimal {
+                    precision: 38,
+                    scale: 2,
+                },
+                nullable: false,
+            },
+        ],
+    });
+
+    let batch = Batch::new(
+        schema,
+        vec![
+            Arc::new(Column::from_scalars(
+                DataType::Decimal {
+                    precision: 38,
+                    scale: 2,
+                },
+                &[Scalar::Decimal(10i128.pow(20), 2)],
+            )),
+            Arc::new(Column::from_scalars(
+                DataType::Decimal {
+                    precision: 38,
+                    scale: 2,
+                },
+                &[Scalar::Decimal(10i128.pow(20), 2)],
+            )),
+        ],
+    );
+
+    let expr = Expr::Binary {
+        op: BinOp::Mul,
+        left: Box::new(Expr::Column(0)),
+        right: Box::new(Expr::Column(1)),
+    };
+
+    let res = eval(&expr, &batch);
+    assert!(res.is_err());
+}
+
+#[test]
+fn decimal_comparison_rescaling_overflow() {
+    let a = Scalar::Decimal(10i128.pow(30), 2);
+    let b = Scalar::Decimal(5, 18);
+    let ord = compare_scalars(&a, &b).unwrap();
+    assert_eq!(ord, std::cmp::Ordering::Greater);
 }

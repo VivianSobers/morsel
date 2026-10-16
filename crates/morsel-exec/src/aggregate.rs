@@ -7,7 +7,7 @@ use morsel_core::{Batch, Column, ColumnData, DataType, Scalar, BATCH_ROWS};
 use morsel_plan::{AggExpr, AggFunc, Expr, LogicalPlan};
 
 use crate::catalog::Catalog;
-use crate::eval::eval;
+use crate::eval::{compare_scalars, eval};
 use crate::execute::execute;
 use crate::scheduler::create_morsels;
 
@@ -357,28 +357,6 @@ impl AggState {
             AggFunc::Min => self.min.clone().unwrap_or(Scalar::Null),
             AggFunc::Max => self.max.clone().unwrap_or(Scalar::Null),
         }
-    }
-}
-
-fn compare_scalars(a: &Scalar, b: &Scalar) -> Result<std::cmp::Ordering> {
-    match (a, b) {
-        (Scalar::Int32(x), Scalar::Int32(y)) => Ok(x.cmp(y)),
-        (Scalar::Int64(x), Scalar::Int64(y)) => Ok(x.cmp(y)),
-        (Scalar::Int32(x), Scalar::Int64(y)) => Ok((*x as i64).cmp(y)),
-        (Scalar::Int64(x), Scalar::Int32(y)) => Ok(x.cmp(&(*y as i64))),
-        (Scalar::Float64(x), Scalar::Float64(y)) => {
-            Ok(x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal))
-        }
-        (Scalar::Date32(x), Scalar::Date32(y)) => Ok(x.cmp(y)),
-        (Scalar::Utf8(x), Scalar::Utf8(y)) => Ok(x.cmp(y)),
-        (Scalar::Bool(x), Scalar::Bool(y)) => Ok(x.cmp(y)),
-        (Scalar::Decimal(v1, s1), Scalar::Decimal(v2, s2)) => {
-            let target_s = (*s1).max(*s2);
-            let r1 = v1 * pow10(target_s - s1);
-            let r2 = v2 * pow10(target_s - s2);
-            Ok(r1.cmp(&r2))
-        }
-        _ => bail!("cannot compare {:?} and {:?}", a, b),
     }
 }
 
