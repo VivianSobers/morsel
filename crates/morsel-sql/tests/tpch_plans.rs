@@ -588,3 +588,38 @@ fn no_cross_join_has_base_scans_on_both_sides() {
         assert_no_base_cross_join(&optimized, q);
     }
 }
+
+#[test]
+fn test_optimizer_steps_preserve_schema_and_column_ranges() {
+    let catalog = tpch_schemas();
+    let stats = tpch_stats();
+    let root = repo_root();
+
+    for q in 1..=22 {
+        let sql_path = root.join("queries/tpch").join(format!("q{:02}.sql", q));
+        let sql = fs::read_to_string(&sql_path)
+            .unwrap_or_else(|e| panic!("failed to read {:?}: {}", sql_path, e));
+        let raw_plan =
+            plan_sql(&sql, &catalog).unwrap_or_else(|e| panic!("failed to plan Q{:02}: {}", q, e));
+        let raw_schema = raw_plan.schema().unwrap();
+        morsel_sql::optimize::validate_plan_columns(&raw_plan).unwrap();
+
+        // 1. Fold constants
+        let folded = morsel_sql::optimize::fold_constants(raw_plan).unwrap();
+        morsel_sql::optimize::check_optimizer_step("fold_constants", &folded, &raw_schema).unwrap();
+
+        // 2. Push predicates
+        let pushed = morsel_sql::optimize::push_predicates(folded).unwrap();
+        morsel_sql::optimize::check_optimizer_step("push_predicates", &pushed, &raw_schema)
+            .unwrap();
+
+        // 3. Order joins
+        let ordered = morsel_sql::optimize::order_joins(pushed, &stats).unwrap();
+        morsel_sql::optimize::check_optimizer_step("order_joins", &ordered, &raw_schema).unwrap();
+
+        // 4. Prune projections
+        let pruned = morsel_sql::optimize::prune_projections(ordered).unwrap();
+        morsel_sql::optimize::check_optimizer_step("prune_projections", &pruned, &raw_schema)
+            .unwrap();
+    }
+}
