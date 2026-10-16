@@ -726,3 +726,12 @@ fn join_keys_differing_types_and_scales() {
     let total_rows: usize = res.iter().map(|b| b.len).sum();
     assert_eq!(total_rows, 1);
 }
+
+#[test]
+fn batch_builder_zero_column_schema() {
+    let schema = Arc::new(Schema { fields: vec![] });
+    let mut builder = morsel_exec::join::BatchBuilder::new(schema);
+    builder.push_row(std::iter::empty());
+    let batches = builder.finish();
+    assert_eq!(batches.len(), 0);
+}

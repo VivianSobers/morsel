@@ -57,14 +57,14 @@ pub struct RowLoc {
     pub row_idx: u32,
 }
 
-struct BatchBuilder {
+pub struct BatchBuilder {
     schema: Arc<Schema>,
     columns: Vec<Vec<Scalar>>,
     batches: Vec<Batch>,
 }
 
 impl BatchBuilder {
-    fn new(schema: Arc<Schema>) -> Self {
+    pub fn new(schema: Arc<Schema>) -> Self {
         let num_cols = schema.fields.len();
         Self {
             schema,
@@ -73,16 +73,16 @@ impl BatchBuilder {
         }
     }
 
-    fn push_row(&mut self, row: impl Iterator<Item = Scalar>) {
+    pub fn push_row(&mut self, row: impl Iterator<Item = Scalar>) {
         for (col_idx, val) in row.enumerate() {
             self.columns[col_idx].push(val);
         }
-        if self.columns[0].len() >= BATCH_ROWS {
+        if !self.columns.is_empty() && self.columns[0].len() >= BATCH_ROWS {
             self.flush();
         }
     }
 
-    fn flush(&mut self) {
+    pub fn flush(&mut self) {
         if self.columns.is_empty() || self.columns[0].is_empty() {
             return;
         }
@@ -96,7 +96,7 @@ impl BatchBuilder {
             .push(Batch::new(Arc::clone(&self.schema), cols));
     }
 
-    fn finish(mut self) -> Vec<Batch> {
+    pub fn finish(mut self) -> Vec<Batch> {
         self.flush();
         self.batches
     }
