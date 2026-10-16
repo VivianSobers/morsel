@@ -5,4 +5,5 @@ members = [
     "crates/morsel-plan",
     "crates/morsel-exec",
     "crates/morsel-sql",
+    "crates/morsel-fuzz",
 ]
