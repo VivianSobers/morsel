@@ -978,7 +978,13 @@ fn float64_cross_type_comparisons() {
     let int = Scalar::Int32(5);
 
     assert_eq!(compare_scalars(&f, &dec).unwrap(), std::cmp::Ordering::Less);
-    assert_eq!(compare_scalars(&dec, &f).unwrap(), std::cmp::Ordering::Greater);
+    assert_eq!(
+        compare_scalars(&dec, &f).unwrap(),
+        std::cmp::Ordering::Greater
+    );
     assert_eq!(compare_scalars(&f, &int).unwrap(), std::cmp::Ordering::Less);
-    assert_eq!(compare_scalars(&int, &f).unwrap(), std::cmp::Ordering::Greater);
+    assert_eq!(
+        compare_scalars(&int, &f).unwrap(),
+        std::cmp::Ordering::Greater
+    );
 }

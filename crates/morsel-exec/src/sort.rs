@@ -312,23 +312,23 @@ pub fn execute_sort(
                 })
             })
             .collect();
-            let mut worker_panic = None;
-            let mut results = Vec::with_capacity(handles.len());
-            for h in handles {
-                match h.join() {
-                    Ok(res) => results.push(res),
-                    Err(payload) => {
-                        if worker_panic.is_none() {
-                            worker_panic = Some(payload);
-                        }
+        let mut worker_panic = None;
+        let mut results = Vec::with_capacity(handles.len());
+        for h in handles {
+            match h.join() {
+                Ok(res) => results.push(res),
+                Err(payload) => {
+                    if worker_panic.is_none() {
+                        worker_panic = Some(payload);
                     }
                 }
             }
-            if let Some(payload) = worker_panic {
-                std::panic::resume_unwind(payload);
-            }
-            results
-        });
+        }
+        if let Some(payload) = worker_panic {
+            std::panic::resume_unwind(payload);
+        }
+        results
+    });
 
     if let Some(err) = error_cell.into_inner().unwrap() {
         return Err(err);
