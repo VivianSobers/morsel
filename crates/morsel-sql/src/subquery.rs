@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, bail, Result};
 use morsel_core::Schema;
@@ -163,6 +163,53 @@ pub(crate) fn contains_outer_ref(
     }
 }
 
+fn collect_inner_col_refs(
+    expr: &sql::Expr,
+    inner_tables: &[InnerTableInfo],
+    schemas: &dyn SchemaProvider,
+    needed_cols: &mut Vec<sql::Expr>,
+    seen_col_names: &mut HashSet<String>,
+) {
+    match expr {
+        sql::Expr::CompoundIdentifier(parts) => {
+            if parts.len() == 2 {
+                let tbl = parts[0].value.to_lowercase();
+                if inner_tables.iter().any(|t| t.alias == tbl) {
+                    let col = parts[1].value.to_lowercase();
+                    if seen_col_names.insert(col) {
+                        needed_cols.push(expr.clone());
+                    }
+                }
+            }
+        }
+        sql::Expr::Identifier(ident) => {
+            let col = &ident.value;
+            let found_in_inner = inner_tables.iter().any(|t| {
+                if let Some(real) = &t.real_table {
+                    if let Some(schema) = schemas.table_schema(real) {
+                        return schema.index_of(col).is_some();
+                    }
+                }
+                false
+            });
+            if found_in_inner {
+                let col_lower = col.to_lowercase();
+                if seen_col_names.insert(col_lower) {
+                    needed_cols.push(expr.clone());
+                }
+            }
+        }
+        sql::Expr::BinaryOp { left, right, .. } => {
+            collect_inner_col_refs(left, inner_tables, schemas, needed_cols, seen_col_names);
+            collect_inner_col_refs(right, inner_tables, schemas, needed_cols, seen_col_names);
+        }
+        sql::Expr::UnaryOp { expr, .. } | sql::Expr::Nested(expr) => {
+            collect_inner_col_refs(expr, inner_tables, schemas, needed_cols, seen_col_names);
+        }
+        _ => {}
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn decorrelate_where(
     selection: &sql::Expr,
@@ -240,9 +287,39 @@ pub(crate) fn decorrelate_where(
                     }
                 }
 
+                let mut needed_inner_cols = Vec::new();
+                let mut seen_col_names = HashSet::new();
+                for (_, inner_expr) in &equi_on {
+                    collect_inner_col_refs(
+                        inner_expr,
+                        &inner_tables,
+                        schemas,
+                        &mut needed_inner_cols,
+                        &mut seen_col_names,
+                    );
+                }
+                for rf in &residual_filters {
+                    collect_inner_col_refs(
+                        rf,
+                        &inner_tables,
+                        schemas,
+                        &mut needed_inner_cols,
+                        &mut seen_col_names,
+                    );
+                }
+
                 let mut modified_subquery = (*subquery).clone();
                 if let sql::SetExpr::Select(ref mut s) = *modified_subquery.body {
                     s.selection = combine_conjuncts(inner_filter_conjuncts);
+                    if !needed_inner_cols.is_empty() {
+                        let has_group_by = !matches!(&s.group_by, sql::GroupByExpr::Expressions(e, _) if e.is_empty());
+                        if !has_group_by {
+                            s.projection = needed_inner_cols
+                                .into_iter()
+                                .map(sql::SelectItem::UnnamedExpr)
+                                .collect();
+                        }
+                    }
                 }
 
                 let sub_plan = bind_query(&modified_subquery, schemas, ctes)?;

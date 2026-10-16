@@ -803,3 +803,61 @@ fn test_q9_and_q17_build_hash_table_on_smaller_side() {
         check_build_side_not_lineitem(&optimized, q);
     }
 }
+
+#[test]
+fn test_q21_projection_pruning_decorrelated_subqueries() {
+    let catalog = tpch_schemas();
+    let stats = tpch_stats();
+    let root = repo_root();
+
+    let sql_path = root.join("queries/tpch/q21.sql");
+    let sql = fs::read_to_string(&sql_path).unwrap();
+    let plan = plan_sql(&sql, &catalog).unwrap();
+    let optimized = optimize(plan, &stats).unwrap();
+
+    fn collect_scans(plan: &LogicalPlan, scans: &mut Vec<(String, Vec<usize>)>) {
+        match plan {
+            LogicalPlan::Scan { table, columns, .. } => {
+                scans.push((table.to_lowercase(), columns.clone()));
+            }
+            LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Project { input, .. }
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. } => {
+                collect_scans(input, scans);
+            }
+            LogicalPlan::Join { left, right, .. } | LogicalPlan::CrossJoin { left, right } => {
+                collect_scans(left, scans);
+                collect_scans(right, scans);
+            }
+        }
+    }
+
+    let mut scans = Vec::new();
+    collect_scans(&optimized, &mut scans);
+
+    for (table, cols) in &scans {
+        if table == "lineitem" {
+            assert!(
+                cols.len() <= 4,
+                "lineitem scan has {} columns ({:?}), expected <= 4",
+                cols.len(),
+                cols
+            );
+            assert!(
+                *cols == vec![0, 2] || *cols == vec![0, 2, 11, 12],
+                "unexpected lineitem scan columns: {:?}",
+                cols
+            );
+        } else if table == "supplier" {
+            assert_eq!(*cols, vec![0, 1, 3]);
+        } else if table == "orders" {
+            assert_eq!(*cols, vec![0, 2]);
+        } else if table == "nation" {
+            assert_eq!(*cols, vec![0, 1]);
+        }
+    }
+    let lineitem_scans: Vec<_> = scans.iter().filter(|(t, _)| t == "lineitem").collect();
+    assert_eq!(lineitem_scans.len(), 3);
+}
