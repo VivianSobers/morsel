@@ -318,10 +318,9 @@ pub fn eval(expr: &Expr, batch: &Batch) -> Result<Column> {
                 } else {
                     let s = col.utf8_value(i);
                     let chars: Vec<char> = s.chars().collect();
-                    let s_idx = if *start > 0 { (*start - 1) as usize } else { 0 };
-                    let len_c = (*len).max(0) as usize;
-                    let e_idx = (s_idx + len_c).min(chars.len());
-                    let sub: String = if s_idx < chars.len() {
+                    let s_idx = ((*start - 1).max(0) as usize).min(chars.len());
+                    let e_idx = ((*start + *len - 1).max(0) as usize).min(chars.len());
+                    let sub: String = if *len > 0 && s_idx < e_idx {
                         chars[s_idx..e_idx].iter().collect()
                     } else {
                         String::new()
@@ -334,7 +333,10 @@ pub fn eval(expr: &Expr, batch: &Batch) -> Result<Column> {
     }
 }
 
-fn cast_column(col: &Column, to: DataType) -> Result<Column> {
+pub fn cast_column(col: &Column, to: DataType) -> Result<Column> {
+    if col.dtype == to {
+        return Ok(col.clone());
+    }
     let len = col.len();
     let mut scalars = Vec::with_capacity(len);
     for i in 0..len {
@@ -579,6 +581,10 @@ pub fn compare_scalars(a: &Scalar, b: &Scalar) -> Result<std::cmp::Ordering> {
         (Scalar::Utf8(x), Scalar::Utf8(y)) => Ok(x.cmp(y)),
         (Scalar::Bool(x), Scalar::Bool(y)) => Ok(x.cmp(y)),
         (Scalar::Decimal(v1, s1), Scalar::Decimal(v2, s2)) => compare_decimals(*v1, *s1, *v2, *s2),
+        (Scalar::Decimal(v, s), Scalar::Int32(x)) => compare_decimals(*v, *s, *x as i128, 0),
+        (Scalar::Int32(x), Scalar::Decimal(v, s)) => compare_decimals(*x as i128, 0, *v, *s),
+        (Scalar::Decimal(v, s), Scalar::Int64(x)) => compare_decimals(*v, *s, *x as i128, 0),
+        (Scalar::Int64(x), Scalar::Decimal(v, s)) => compare_decimals(*x as i128, 0, *v, *s),
         _ => bail!("cannot compare {:?} and {:?}", a, b),
     }
 }

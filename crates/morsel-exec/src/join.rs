@@ -3,12 +3,12 @@ use std::sync::{Arc, Mutex};
 
 use ahash::AHashMap;
 use anyhow::Result;
-use morsel_core::{Batch, Column, Scalar, Schema, BATCH_ROWS};
+use morsel_core::{Batch, Column, DataType, Scalar, Schema, BATCH_ROWS};
 use morsel_plan::{Expr, JoinType, LogicalPlan};
 
 use crate::aggregate::{column_get_key, ScalarKey};
 use crate::catalog::Catalog;
-use crate::eval::{eval, eval_predicate};
+use crate::eval::{cast_column, eval, eval_predicate};
 use crate::execute::execute;
 use crate::scheduler::create_morsels;
 
@@ -124,6 +124,31 @@ fn test_filter_pair(
     Ok(!sel.is_empty())
 }
 
+pub fn coerce_join_key_types(t1: &DataType, t2: &DataType) -> Option<DataType> {
+    if t1 == t2 {
+        return Some(*t1);
+    }
+    match (t1, t2) {
+        (DataType::Int32, DataType::Int64) | (DataType::Int64, DataType::Int32) => {
+            Some(DataType::Int64)
+        }
+        (DataType::Decimal { scale: s1, .. }, DataType::Decimal { scale: s2, .. }) => {
+            Some(DataType::Decimal {
+                precision: 38,
+                scale: *s1.max(s2),
+            })
+        }
+        (DataType::Decimal { scale, .. }, DataType::Int32 | DataType::Int64)
+        | (DataType::Int32 | DataType::Int64, DataType::Decimal { scale, .. }) => {
+            Some(DataType::Decimal {
+                precision: 38,
+                scale: *scale,
+            })
+        }
+        _ => None,
+    }
+}
+
 pub fn execute_join(
     left: &LogicalPlan,
     right: &LogicalPlan,
@@ -137,6 +162,17 @@ pub fn execute_join(
     let left_batches = execute(left, catalog, threads)?;
     let left_schema = left.schema()?;
     let right_schema = right.schema()?;
+
+    let key_types: Vec<DataType> = on
+        .iter()
+        .map(|(l_expr, r_expr)| {
+            let lt = l_expr.data_type(&left_schema)?;
+            let rt = r_expr.data_type(&right_schema)?;
+            coerce_join_key_types(&lt, &rt).ok_or_else(|| {
+                anyhow::anyhow!("cannot join on incompatible types: {:?} and {:?}", lt, rt)
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     // Build combined schema for residual filter evaluation
     let mut combined_fields = left_schema.fields.clone();
@@ -172,7 +208,15 @@ pub fn execute_join(
     for (b_idx, r_batch) in right_batches.iter().enumerate() {
         let r_key_cols: Vec<Column> = on
             .iter()
-            .map(|(_, r_expr)| eval(r_expr, r_batch))
+            .enumerate()
+            .map(|(k, (_, r_expr))| {
+                let col = eval(r_expr, r_batch)?;
+                if col.dtype != key_types[k] {
+                    cast_column(&col, key_types[k])
+                } else {
+                    Ok(col)
+                }
+            })
             .collect::<Result<Vec<_>>>()?;
 
         for r_idx in 0..r_batch.len {
@@ -209,6 +253,7 @@ pub fn execute_join(
             let r_batches = &right_batches;
             let out_sch = &out_schema;
             let comb_sch = &combined_schema;
+            let k_types = &key_types;
             let l_cols_len = left_schema.fields.len();
             let r_cols_len = right_schema.fields.len();
 
@@ -227,7 +272,15 @@ pub fn execute_join(
                 for l_batch in &morsel.batches {
                     let l_key_cols: Vec<Column> = match on
                         .iter()
-                        .map(|(l_expr, _)| eval(l_expr, l_batch))
+                        .enumerate()
+                        .map(|(k, (l_expr, _))| {
+                            let col = eval(l_expr, l_batch)?;
+                            if col.dtype != k_types[k] {
+                                cast_column(&col, k_types[k])
+                            } else {
+                                Ok(col)
+                            }
+                        })
                         .collect::<Result<Vec<_>>>()
                     {
                         Ok(cols) => cols,
