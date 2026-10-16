@@ -600,6 +600,7 @@ fn bind_select(
                             &group_exprs,
                             &agg_collector.aggs,
                             &binder_ctx,
+                            &agg_schema,
                         )?;
                         let name = expr_default_name(e, "col");
                         final_proj.push((expr, name));
@@ -610,6 +611,7 @@ fn bind_select(
                             &group_exprs,
                             &agg_collector.aggs,
                             &binder_ctx,
+                            &agg_schema,
                         )?;
                         final_proj.push((expr, alias.value.clone()));
                     }
@@ -1081,8 +1083,10 @@ impl<'a> ExprBinderContext<'a> {
                 let b_low = self.bind_expr(low)?;
                 let b_high = self.bind_expr(high)?;
 
-                let (b_expr_low, b_low) = coerce_for_cmp(b_expr.clone(), b_low, self.from_schema)?;
-                let (b_expr_high, b_high) = coerce_for_cmp(b_expr, b_high, self.from_schema)?;
+                let (b_expr_low, b_low) =
+                    coerce_binary_operands(b_expr.clone(), b_low, BinOp::GtEq, self.from_schema)?;
+                let (b_expr_high, b_high) =
+                    coerce_binary_operands(b_expr, b_high, BinOp::LtEq, self.from_schema)?;
 
                 let gte = Expr::Binary {
                     op: BinOp::GtEq,
@@ -1110,15 +1114,8 @@ impl<'a> ExprBinderContext<'a> {
                 let b_right = self.bind_expr(right)?;
                 let bin_op = map_bin_op(op)?;
 
-                let (final_l, final_r) = match bin_op {
-                    BinOp::Eq
-                    | BinOp::NotEq
-                    | BinOp::Lt
-                    | BinOp::LtEq
-                    | BinOp::Gt
-                    | BinOp::GtEq => coerce_for_cmp(b_left, b_right, self.from_schema)?,
-                    _ => (b_left, b_right),
-                };
+                let (final_l, final_r) =
+                    coerce_binary_operands(b_left, b_right, bin_op, self.from_schema)?;
 
                 Ok(Expr::Binary {
                     op: bin_op,
@@ -1156,7 +1153,7 @@ impl<'a> ExprBinderContext<'a> {
                 list,
                 negated,
             } => {
-                let b = self.bind_expr(expr)?;
+                let mut b = self.bind_expr(expr)?;
                 let mut scalars = Vec::new();
                 for item in list {
                     match item {
@@ -1182,6 +1179,35 @@ impl<'a> ExprBinderContext<'a> {
                         other => bail!("unsupported IN list item: {:?}", other),
                     }
                 }
+
+                if let Ok(expr_type) = b.data_type(self.from_schema) {
+                    if is_numeric(&expr_type) {
+                        let mut types = vec![expr_type];
+                        for s in &scalars {
+                            if let Some(st) = scalar_dtype(s) {
+                                types.push(st);
+                            }
+                        }
+                        if let Some(target) = unify_data_types(&types) {
+                            if expr_type != target {
+                                b = Expr::Cast {
+                                    expr: Box::new(b),
+                                    to: target,
+                                };
+                            }
+                            let mut new_scalars = Vec::with_capacity(scalars.len());
+                            for s in &scalars {
+                                if let Some(cs) = cast_scalar(s, &target) {
+                                    new_scalars.push(cs);
+                                } else {
+                                    new_scalars.push(s.clone());
+                                }
+                            }
+                            scalars = new_scalars;
+                        }
+                    }
+                }
+
                 Ok(Expr::InList {
                     expr: Box::new(b),
                     list: scalars,
@@ -1197,10 +1223,14 @@ impl<'a> ExprBinderContext<'a> {
                 let mut whens = Vec::new();
                 for (cond, res) in conditions.iter().zip(results) {
                     let cond_expr = if let Some(op) = operand {
+                        let b_op = self.bind_expr(op)?;
+                        let b_cond = self.bind_expr(cond)?;
+                        let (final_op, final_cond) =
+                            coerce_binary_operands(b_op, b_cond, BinOp::Eq, self.from_schema)?;
                         Expr::Binary {
                             op: BinOp::Eq,
-                            left: Box::new(self.bind_expr(op)?),
-                            right: Box::new(self.bind_expr(cond)?),
+                            left: Box::new(final_op),
+                            right: Box::new(final_cond),
                         }
                     } else {
                         self.bind_expr(cond)?
@@ -1208,12 +1238,46 @@ impl<'a> ExprBinderContext<'a> {
                     let res_expr = self.bind_expr(res)?;
                     whens.push((cond_expr, res_expr));
                 }
-                let else_expr = if let Some(el) = else_result {
+                let mut else_expr = if let Some(el) = else_result {
                     Some(Box::new(self.bind_expr(el)?))
                 } else {
                     None
                 };
+                unify_case_branches(&mut whens, &mut else_expr, self.from_schema)?;
                 Ok(Expr::Case { whens, else_expr })
+            }
+            sql::Expr::Function(func) if func.name.to_string().eq_ignore_ascii_case("coalesce") => {
+                let (args, _) = get_function_args(func);
+                if args.is_empty() {
+                    bail!("COALESCE requires at least one argument");
+                }
+                let expr_args: Vec<sql::Expr> = args
+                    .into_iter()
+                    .filter_map(|arg| {
+                        if let sql::FunctionArg::Unnamed(sql::FunctionArgExpr::Expr(e)) = arg {
+                            Some(e.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if expr_args.len() == 1 {
+                    self.bind_expr(&expr_args[0])
+                } else {
+                    let mut whens = Vec::new();
+                    for arg in &expr_args[..expr_args.len() - 1] {
+                        let cond = sql::Expr::IsNotNull(Box::new(arg.clone()));
+                        whens.push((cond, arg.clone()));
+                    }
+                    let else_res = expr_args.last().cloned();
+                    let case_expr = sql::Expr::Case {
+                        operand: None,
+                        conditions: whens.iter().map(|(c, _)| c.clone()).collect(),
+                        results: whens.into_iter().map(|(_, r)| r).collect(),
+                        else_result: else_res.map(Box::new),
+                    };
+                    self.bind_expr(&case_expr)
+                }
             }
             sql::Expr::Cast {
                 expr, data_type, ..
@@ -1271,30 +1335,272 @@ impl<'a> ExprBinderContext<'a> {
     }
 }
 
-pub(crate) fn coerce_for_cmp(left: Expr, right: Expr, schema: &Schema) -> Result<(Expr, Expr)> {
-    let lt = left.data_type(schema).ok();
-    let rt = right.data_type(schema).ok();
+pub(crate) fn pow10(n: u8) -> i128 {
+    10_i128.pow(n as u32)
+}
 
-    match (lt, rt) {
-        (Some(DataType::Decimal { .. }), Some(DataType::Int32 | DataType::Int64)) => {
-            if let Expr::Literal(Scalar::Int32(x)) = right {
-                return Ok((left, Expr::Literal(Scalar::Decimal(x as i128, 0))));
-            }
-            if let Expr::Literal(Scalar::Int64(x)) = right {
-                return Ok((left, Expr::Literal(Scalar::Decimal(x as i128, 0))));
-            }
-        }
-        (Some(DataType::Int32 | DataType::Int64), Some(DataType::Decimal { .. })) => {
-            if let Expr::Literal(Scalar::Int32(x)) = left {
-                return Ok((Expr::Literal(Scalar::Decimal(x as i128, 0)), right));
-            }
-            if let Expr::Literal(Scalar::Int64(x)) = left {
-                return Ok((Expr::Literal(Scalar::Decimal(x as i128, 0)), right));
-            }
-        }
-        _ => {}
+pub(crate) fn is_numeric(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Int32 | DataType::Int64 | DataType::Float64 | DataType::Decimal { .. }
+    )
+}
+
+fn scalar_dtype(s: &Scalar) -> Option<DataType> {
+    match s {
+        Scalar::Int32(_) => Some(DataType::Int32),
+        Scalar::Int64(_) => Some(DataType::Int64),
+        Scalar::Float64(_) => Some(DataType::Float64),
+        Scalar::Decimal(_, scale) => Some(DataType::Decimal {
+            precision: 38,
+            scale: *scale,
+        }),
+        _ => None,
     }
+}
+
+pub(crate) fn cast_scalar(s: &Scalar, to: &DataType) -> Option<Scalar> {
+    match (s, to) {
+        (Scalar::Int32(x), DataType::Int32) => Some(Scalar::Int32(*x)),
+        (Scalar::Int32(x), DataType::Int64) => Some(Scalar::Int64(*x as i64)),
+        (Scalar::Int32(x), DataType::Float64) => Some(Scalar::Float64(*x as f64)),
+        (Scalar::Int32(x), DataType::Decimal { scale, .. }) => {
+            Some(Scalar::Decimal(*x as i128 * pow10(*scale), *scale))
+        }
+
+        (Scalar::Int64(x), DataType::Int64) => Some(Scalar::Int64(*x)),
+        (Scalar::Int64(x), DataType::Int32) => Some(Scalar::Int32(*x as i32)),
+        (Scalar::Int64(x), DataType::Float64) => Some(Scalar::Float64(*x as f64)),
+        (Scalar::Int64(x), DataType::Decimal { scale, .. }) => {
+            Some(Scalar::Decimal(*x as i128 * pow10(*scale), *scale))
+        }
+
+        (Scalar::Float64(x), DataType::Float64) => Some(Scalar::Float64(*x)),
+        (Scalar::Float64(x), DataType::Decimal { scale, .. }) => Some(Scalar::Decimal(
+            (*x * pow10(*scale) as f64).round() as i128,
+            *scale,
+        )),
+
+        (
+            Scalar::Decimal(x, s),
+            DataType::Decimal {
+                scale: target_s, ..
+            },
+        ) => {
+            if *target_s >= *s {
+                Some(Scalar::Decimal(*x * pow10(*target_s - *s), *target_s))
+            } else {
+                Some(Scalar::Decimal(*x / pow10(*s - *target_s), *target_s))
+            }
+        }
+        (Scalar::Decimal(x, s), DataType::Float64) => {
+            Some(Scalar::Float64(*x as f64 / pow10(*s) as f64))
+        }
+
+        (Scalar::Utf8(s), DataType::Utf8) => Some(Scalar::Utf8(s.clone())),
+        (Scalar::Date32(d), DataType::Date32) => Some(Scalar::Date32(*d)),
+        (Scalar::Bool(b), DataType::Bool) => Some(Scalar::Bool(*b)),
+        _ => None,
+    }
+}
+
+pub(crate) fn needs_cast(current: &DataType, target: &DataType) -> bool {
+    if current == target {
+        return false;
+    }
+    if let (DataType::Decimal { scale: s1, .. }, DataType::Decimal { scale: s2, .. }) =
+        (current, target)
+    {
+        return s1 != s2;
+    }
+    true
+}
+
+pub(crate) fn unify_two_types(t1: &DataType, t2: &DataType) -> Option<DataType> {
+    if t1 == t2 {
+        return Some(*t1);
+    }
+    if !is_numeric(t1) || !is_numeric(t2) {
+        return None;
+    }
+    if *t1 == DataType::Float64 || *t2 == DataType::Float64 {
+        return Some(DataType::Float64);
+    }
+    if let (DataType::Decimal { scale: s1, .. }, DataType::Decimal { scale: s2, .. }) = (t1, t2) {
+        return Some(DataType::Decimal {
+            precision: 38,
+            scale: (*s1).max(*s2),
+        });
+    }
+    if let (DataType::Decimal { scale, .. }, DataType::Int32 | DataType::Int64)
+    | (DataType::Int32 | DataType::Int64, DataType::Decimal { scale, .. }) = (t1, t2)
+    {
+        return Some(DataType::Decimal {
+            precision: 38,
+            scale: *scale,
+        });
+    }
+    if matches!(
+        (t1, t2),
+        (DataType::Int32, DataType::Int64) | (DataType::Int64, DataType::Int32)
+    ) {
+        return Some(DataType::Int64);
+    }
+    None
+}
+
+pub(crate) fn unify_data_types(types: &[DataType]) -> Option<DataType> {
+    if types.is_empty() {
+        return None;
+    }
+    let mut current = types[0];
+    for t in &types[1..] {
+        current = unify_two_types(&current, t)?;
+    }
+    Some(current)
+}
+
+pub(crate) fn unify_case_branches(
+    whens: &mut [(Expr, Expr)],
+    else_expr: &mut Option<Box<Expr>>,
+    schema: &Schema,
+) -> Result<()> {
+    let mut types = Vec::new();
+    for (_, res) in whens.iter() {
+        if let Ok(t) = res.data_type(schema) {
+            types.push(t);
+        }
+    }
+    if let Some(el) = else_expr {
+        if let Ok(t) = el.data_type(schema) {
+            types.push(t);
+        }
+    }
+    if let Some(target) = unify_data_types(&types) {
+        for (_, res) in whens.iter_mut() {
+            if let Ok(cur_t) = res.data_type(schema) {
+                if needs_cast(&cur_t, &target) {
+                    *res = Expr::Cast {
+                        expr: Box::new(res.clone()),
+                        to: target,
+                    };
+                }
+            }
+        }
+        if let Some(el) = else_expr {
+            if let Ok(cur_t) = el.data_type(schema) {
+                if needs_cast(&cur_t, &target) {
+                    let inner = el.clone();
+                    **el = Expr::Cast {
+                        expr: inner,
+                        to: target,
+                    };
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn coerce_binary_operands(
+    left: Expr,
+    right: Expr,
+    op: BinOp,
+    schema: &Schema,
+) -> Result<(Expr, Expr)> {
+    if matches!(op, BinOp::And | BinOp::Or) {
+        return Ok((left, right));
+    }
+
+    let lt = match left.data_type(schema) {
+        Ok(t) => t,
+        Err(_) => return Ok((left, right)),
+    };
+    let rt = match right.data_type(schema) {
+        Ok(t) => t,
+        Err(_) => return Ok((left, right)),
+    };
+
+    if !is_numeric(&lt) || !is_numeric(&rt) {
+        return Ok((left, right));
+    }
+
+    if lt == rt {
+        return Ok((left, right));
+    }
+
+    // Follow docs/plan-m1.md typing rules:
+    // anything with Float64 becomes Float64
+    if lt == DataType::Float64 {
+        return Ok((
+            left,
+            Expr::Cast {
+                expr: Box::new(right),
+                to: DataType::Float64,
+            },
+        ));
+    }
+    if rt == DataType::Float64 {
+        return Ok((
+            Expr::Cast {
+                expr: Box::new(left),
+                to: DataType::Float64,
+            },
+            right,
+        ));
+    }
+
+    // integer with Decimal becomes Decimal with the integer at scale 0
+    if matches!(lt, DataType::Decimal { .. }) && matches!(rt, DataType::Int32 | DataType::Int64) {
+        return Ok((
+            left,
+            Expr::Cast {
+                expr: Box::new(right),
+                to: DataType::Decimal {
+                    precision: 38,
+                    scale: 0,
+                },
+            },
+        ));
+    }
+    if matches!(rt, DataType::Decimal { .. }) && matches!(lt, DataType::Int32 | DataType::Int64) {
+        return Ok((
+            Expr::Cast {
+                expr: Box::new(left),
+                to: DataType::Decimal {
+                    precision: 38,
+                    scale: 0,
+                },
+            },
+            right,
+        ));
+    }
+
+    // Int32 op Int64 gives Int64
+    if lt == DataType::Int32 && rt == DataType::Int64 {
+        return Ok((
+            Expr::Cast {
+                expr: Box::new(left),
+                to: DataType::Int64,
+            },
+            right,
+        ));
+    }
+    if lt == DataType::Int64 && rt == DataType::Int32 {
+        return Ok((
+            left,
+            Expr::Cast {
+                expr: Box::new(right),
+                to: DataType::Int64,
+            },
+        ));
+    }
+
     Ok((left, right))
+}
+
+pub(crate) fn coerce_for_cmp(left: Expr, right: Expr, schema: &Schema) -> Result<(Expr, Expr)> {
+    coerce_binary_operands(left, right, BinOp::Eq, schema)
 }
 
 pub(crate) fn map_bin_op(op: &sql::BinaryOperator) -> Result<BinOp> {
@@ -1556,6 +1862,12 @@ impl AggCollector {
                         self.aggs.push((f, arg, alias));
                     }
                     return Ok(());
+                } else {
+                    for arg in args {
+                        if let sql::FunctionArg::Unnamed(sql::FunctionArgExpr::Expr(e)) = arg {
+                            self.find_aggs(e)?;
+                        }
+                    }
                 }
             }
             sql::Expr::BinaryOp { left, right, .. } => {
@@ -1594,6 +1906,7 @@ pub(crate) fn rewrite_post_agg_expr(
     group_by: &[(Expr, String)],
     aggs: &[(AggFunc, Option<sql::Expr>, String)],
     binder_ctx: &ExprBinderContext,
+    schema: &Schema,
 ) -> Result<Expr> {
     if let Ok(b_expr) = binder_ctx.bind_expr(expr) {
         if let Some(pos) = group_by.iter().position(|(g, _)| *g == b_expr) {
@@ -1648,16 +1961,92 @@ pub(crate) fn rewrite_post_agg_expr(
 
                 return Ok(Expr::Column(group_by.len() + pos));
             }
+            if name == "coalesce" {
+                if args.is_empty() {
+                    bail!("COALESCE requires at least one argument");
+                }
+                let expr_args: Vec<sql::Expr> = args
+                    .into_iter()
+                    .filter_map(|arg| {
+                        if let sql::FunctionArg::Unnamed(sql::FunctionArgExpr::Expr(e)) = arg {
+                            Some(e.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if expr_args.len() == 1 {
+                    return rewrite_post_agg_expr(
+                        &expr_args[0],
+                        group_by,
+                        aggs,
+                        binder_ctx,
+                        schema,
+                    );
+                } else {
+                    let mut whens = Vec::new();
+                    for arg in &expr_args[..expr_args.len() - 1] {
+                        let cond = sql::Expr::IsNotNull(Box::new(arg.clone()));
+                        whens.push((cond, arg.clone()));
+                    }
+                    let else_res = expr_args.last().cloned();
+                    let case_expr = sql::Expr::Case {
+                        operand: None,
+                        conditions: whens.iter().map(|(c, _)| c.clone()).collect(),
+                        results: whens.into_iter().map(|(_, r)| r).collect(),
+                        else_result: else_res.map(Box::new),
+                    };
+                    return rewrite_post_agg_expr(&case_expr, group_by, aggs, binder_ctx, schema);
+                }
+            }
             bail!("unsupported function in post-agg: {:?}", expr);
         }
         sql::Expr::BinaryOp { left, op, right } => {
-            let l = rewrite_post_agg_expr(left, group_by, aggs, binder_ctx)?;
-            let r = rewrite_post_agg_expr(right, group_by, aggs, binder_ctx)?;
+            let l = rewrite_post_agg_expr(left, group_by, aggs, binder_ctx, schema)?;
+            let r = rewrite_post_agg_expr(right, group_by, aggs, binder_ctx, schema)?;
+            let bin_op = map_bin_op(op)?;
+            let (final_l, final_r) = coerce_binary_operands(l, r, bin_op, schema)?;
             Ok(Expr::Binary {
-                op: map_bin_op(op)?,
-                left: Box::new(l),
-                right: Box::new(r),
+                op: bin_op,
+                left: Box::new(final_l),
+                right: Box::new(final_r),
             })
+        }
+        sql::Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
+            let b_expr = rewrite_post_agg_expr(expr, group_by, aggs, binder_ctx, schema)?;
+            let b_low = rewrite_post_agg_expr(low, group_by, aggs, binder_ctx, schema)?;
+            let b_high = rewrite_post_agg_expr(high, group_by, aggs, binder_ctx, schema)?;
+
+            let (b_expr_low, b_low) =
+                coerce_binary_operands(b_expr.clone(), b_low, BinOp::GtEq, schema)?;
+            let (b_expr_high, b_high) =
+                coerce_binary_operands(b_expr, b_high, BinOp::LtEq, schema)?;
+
+            let gte = Expr::Binary {
+                op: BinOp::GtEq,
+                left: Box::new(b_expr_low),
+                right: Box::new(b_low),
+            };
+            let lte = Expr::Binary {
+                op: BinOp::LtEq,
+                left: Box::new(b_expr_high),
+                right: Box::new(b_high),
+            };
+            let and = Expr::Binary {
+                op: BinOp::And,
+                left: Box::new(gte),
+                right: Box::new(lte),
+            };
+            if *negated {
+                Ok(Expr::Not(Box::new(and)))
+            } else {
+                Ok(and)
+            }
         }
         sql::Expr::UnaryOp {
             op: sql::UnaryOperator::Minus,
@@ -1674,7 +2063,7 @@ pub(crate) fn rewrite_post_agg_expr(
                 };
                 Ok(Expr::Literal(neg))
             } else {
-                let sub = rewrite_post_agg_expr(expr, group_by, aggs, binder_ctx)?;
+                let sub = rewrite_post_agg_expr(expr, group_by, aggs, binder_ctx, schema)?;
                 Ok(Expr::Negate(Box::new(sub)))
             }
         }
@@ -1682,7 +2071,7 @@ pub(crate) fn rewrite_post_agg_expr(
             op: sql::UnaryOperator::Not,
             expr,
         } => {
-            let sub = rewrite_post_agg_expr(expr, group_by, aggs, binder_ctx)?;
+            let sub = rewrite_post_agg_expr(expr, group_by, aggs, binder_ctx, schema)?;
             Ok(Expr::Not(Box::new(sub)))
         }
         sql::Expr::Value(v) => Ok(Expr::Literal(parse_sql_value(v)?)),
@@ -1694,23 +2083,26 @@ pub(crate) fn rewrite_post_agg_expr(
         } => {
             let mut whens = Vec::new();
             for (c, r) in conditions.iter().zip(results) {
-                let b_c = rewrite_post_agg_expr(c, group_by, aggs, binder_ctx)?;
-                let b_r = rewrite_post_agg_expr(r, group_by, aggs, binder_ctx)?;
+                let b_c = rewrite_post_agg_expr(c, group_by, aggs, binder_ctx, schema)?;
+                let b_r = rewrite_post_agg_expr(r, group_by, aggs, binder_ctx, schema)?;
                 whens.push((b_c, b_r));
             }
-            let el = if let Some(e) = else_result {
+            let mut el = if let Some(e) = else_result {
                 Some(Box::new(rewrite_post_agg_expr(
-                    e, group_by, aggs, binder_ctx,
+                    e, group_by, aggs, binder_ctx, schema,
                 )?))
             } else {
                 None
             };
+            unify_case_branches(&mut whens, &mut el, schema)?;
             Ok(Expr::Case {
                 whens,
                 else_expr: el,
             })
         }
-        sql::Expr::Nested(inner) => rewrite_post_agg_expr(inner, group_by, aggs, binder_ctx),
+        sql::Expr::Nested(inner) => {
+            rewrite_post_agg_expr(inner, group_by, aggs, binder_ctx, schema)
+        }
         other => binder_ctx.bind_expr(other),
     }
 }

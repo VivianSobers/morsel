@@ -1,26 +1,244 @@
 use std::collections::{HashMap, HashSet};
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use chrono::{Datelike, Duration, NaiveDate};
-use morsel_core::{DataType, Scalar};
+use morsel_core::{DataType, Scalar, Schema};
 use morsel_plan::{BinOp, Expr, JoinType, LogicalPlan, SortKey};
 use regex::Regex;
 
 pub fn optimize(plan: LogicalPlan, stats: &HashMap<String, usize>) -> Result<LogicalPlan> {
+    let root_schema = plan.schema()?;
+    validate_plan_columns(&plan)?;
+
     // 1. Constant folding
     let plan = fold_constants(plan)?;
+    check_optimizer_step("fold_constants", &plan, &root_schema)?;
 
     // 2. Predicate pushdown (pushes filters through projections, aggregates, down into join sides and to scans)
     let plan = push_predicates(plan)?;
+    check_optimizer_step("push_predicates", &plan, &root_schema)?;
 
     // 3. Join ordering (greedy by estimated rows from stats, turns comma joins into hash joins)
     let plan = order_joins(plan, stats)?;
+    check_optimizer_step("order_joins", &plan, &root_schema)?;
 
     // 4. Projection pruning
     // Base table columns are already pruned down to scans by bind.rs
     let plan = prune_projections(plan)?;
+    check_optimizer_step("prune_projections", &plan, &root_schema)?;
 
     Ok(plan)
+}
+
+pub fn check_optimizer_step(
+    step_name: &str,
+    step_plan: &LogicalPlan,
+    expected_schema: &Schema,
+) -> Result<()> {
+    let schema = step_plan.schema().map_err(|e| {
+        anyhow::anyhow!(
+            "step '{}' produced plan with invalid schema: {}",
+            step_name,
+            e
+        )
+    })?;
+    if schema.fields.len() != expected_schema.fields.len() {
+        bail!(
+            "step '{}' changed root schema length: expected {}, got {}",
+            step_name,
+            expected_schema.fields.len(),
+            schema.fields.len()
+        );
+    }
+    for (i, (f_actual, f_exp)) in schema
+        .fields
+        .iter()
+        .zip(&expected_schema.fields)
+        .enumerate()
+    {
+        if f_actual.name != f_exp.name || f_actual.dtype != f_exp.dtype {
+            bail!(
+                "step '{}' changed root column {}: expected {}: {:?}, got {}: {:?}",
+                step_name,
+                i,
+                f_exp.name,
+                f_exp.dtype,
+                f_actual.name,
+                f_actual.dtype
+            );
+        }
+    }
+    validate_plan_columns(step_plan).map_err(|e| {
+        anyhow::anyhow!("step '{}' produced invalid column index: {}", step_name, e)
+    })?;
+    Ok(())
+}
+
+pub fn validate_plan_columns(plan: &LogicalPlan) -> Result<()> {
+    match plan {
+        LogicalPlan::Scan {
+            columns,
+            table_schema,
+            ..
+        } => {
+            for &col in columns {
+                if col >= table_schema.fields.len() {
+                    bail!(
+                        "Scan column index {} out of range (schema has {} cols)",
+                        col,
+                        table_schema.fields.len()
+                    );
+                }
+            }
+            Ok(())
+        }
+        LogicalPlan::Filter { input, predicate } => {
+            validate_plan_columns(input)?;
+            let input_schema = input.schema()?;
+            let mut cols = HashSet::new();
+            expr_references_columns(predicate, &mut cols);
+            for col in cols {
+                if col >= input_schema.len() {
+                    bail!(
+                        "Filter column index {} out of range (input has {} cols)",
+                        col,
+                        input_schema.len()
+                    );
+                }
+            }
+            Ok(())
+        }
+        LogicalPlan::Project { input, exprs } => {
+            validate_plan_columns(input)?;
+            let input_schema = input.schema()?;
+            for (e, _) in exprs {
+                let mut cols = HashSet::new();
+                expr_references_columns(e, &mut cols);
+                for col in cols {
+                    if col >= input_schema.len() {
+                        bail!(
+                            "Project column index {} out of range (input has {} cols)",
+                            col,
+                            input_schema.len()
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggs,
+        } => {
+            validate_plan_columns(input)?;
+            let input_schema = input.schema()?;
+            for (e, _) in group_by {
+                let mut cols = HashSet::new();
+                expr_references_columns(e, &mut cols);
+                for col in cols {
+                    if col >= input_schema.len() {
+                        bail!(
+                            "Aggregate group_by column index {} out of range (input has {} cols)",
+                            col,
+                            input_schema.len()
+                        );
+                    }
+                }
+            }
+            for (agg, _) in aggs {
+                if let Some(arg) = &agg.arg {
+                    let mut cols = HashSet::new();
+                    expr_references_columns(arg, &mut cols);
+                    for col in cols {
+                        if col >= input_schema.len() {
+                            bail!(
+                                "Aggregate arg column index {} out of range (input has {} cols)",
+                                col,
+                                input_schema.len()
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        LogicalPlan::Join {
+            left,
+            right,
+            on,
+            filter,
+            ..
+        } => {
+            validate_plan_columns(left)?;
+            validate_plan_columns(right)?;
+            let left_len = left.schema()?.len();
+            let right_len = right.schema()?.len();
+            for (l, r) in on {
+                let mut l_cols = HashSet::new();
+                expr_references_columns(l, &mut l_cols);
+                for col in l_cols {
+                    if col >= left_len {
+                        bail!(
+                            "Join on left column index {} out of range (left has {} cols)",
+                            col,
+                            left_len
+                        );
+                    }
+                }
+                let mut r_cols = HashSet::new();
+                expr_references_columns(r, &mut r_cols);
+                for col in r_cols {
+                    if col >= right_len {
+                        bail!(
+                            "Join on right column index {} out of range (right has {} cols)",
+                            col,
+                            right_len
+                        );
+                    }
+                }
+            }
+            if let Some(f) = filter {
+                let mut f_cols = HashSet::new();
+                expr_references_columns(f, &mut f_cols);
+                let total = left_len + right_len;
+                for col in f_cols {
+                    if col >= total {
+                        bail!(
+                            "Join filter column index {} out of range (join has {} cols)",
+                            col,
+                            total
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        LogicalPlan::CrossJoin { left, right } => {
+            validate_plan_columns(left)?;
+            validate_plan_columns(right)?;
+            Ok(())
+        }
+        LogicalPlan::Sort { input, keys } => {
+            validate_plan_columns(input)?;
+            let input_schema = input.schema()?;
+            for key in keys {
+                let mut cols = HashSet::new();
+                expr_references_columns(&key.expr, &mut cols);
+                for col in cols {
+                    if col >= input_schema.len() {
+                        bail!(
+                            "Sort key column index {} out of range (input has {} cols)",
+                            col,
+                            input_schema.len()
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        LogicalPlan::Limit { input, .. } => validate_plan_columns(input),
+    }
 }
 
 // ============================================================================
@@ -875,44 +1093,47 @@ pub fn expr_references_columns(expr: &Expr, cols: &mut HashSet<usize>) {
     }
 }
 
-pub fn remap_expr_columns(expr: Expr, offset: i64) -> Expr {
+pub fn remap_expr_indices<F>(expr: Expr, f: &F) -> Expr
+where
+    F: Fn(usize) -> usize,
+{
     match expr {
-        Expr::Column(idx) => Expr::Column((idx as i64 + offset) as usize),
+        Expr::Column(idx) => Expr::Column(f(idx)),
         Expr::Literal(s) => Expr::Literal(s),
-        Expr::Not(inner) => Expr::Not(Box::new(remap_expr_columns(*inner, offset))),
-        Expr::Negate(inner) => Expr::Negate(Box::new(remap_expr_columns(*inner, offset))),
-        Expr::IsNull(inner) => Expr::IsNull(Box::new(remap_expr_columns(*inner, offset))),
+        Expr::Not(inner) => Expr::Not(Box::new(remap_expr_indices(*inner, f))),
+        Expr::Negate(inner) => Expr::Negate(Box::new(remap_expr_indices(*inner, f))),
+        Expr::IsNull(inner) => Expr::IsNull(Box::new(remap_expr_indices(*inner, f))),
         Expr::Binary { op, left, right } => Expr::Binary {
             op,
-            left: Box::new(remap_expr_columns(*left, offset)),
-            right: Box::new(remap_expr_columns(*right, offset)),
+            left: Box::new(remap_expr_indices(*left, f)),
+            right: Box::new(remap_expr_indices(*right, f)),
         },
         Expr::Extract { field, expr } => Expr::Extract {
             field,
-            expr: Box::new(remap_expr_columns(*expr, offset)),
+            expr: Box::new(remap_expr_indices(*expr, f)),
         },
         Expr::Substring { expr, start, len } => Expr::Substring {
-            expr: Box::new(remap_expr_columns(*expr, offset)),
+            expr: Box::new(remap_expr_indices(*expr, f)),
             start,
             len,
         },
         Expr::Cast { expr, to } => Expr::Cast {
-            expr: Box::new(remap_expr_columns(*expr, offset)),
+            expr: Box::new(remap_expr_indices(*expr, f)),
             to,
         },
         Expr::Case { whens, else_expr } => Expr::Case {
             whens: whens
                 .into_iter()
-                .map(|(c, v)| (remap_expr_columns(c, offset), remap_expr_columns(v, offset)))
+                .map(|(c, v)| (remap_expr_indices(c, f), remap_expr_indices(v, f)))
                 .collect(),
-            else_expr: else_expr.map(|e| Box::new(remap_expr_columns(*e, offset))),
+            else_expr: else_expr.map(|e| Box::new(remap_expr_indices(*e, f))),
         },
         Expr::InList {
             expr,
             list,
             negated,
         } => Expr::InList {
-            expr: Box::new(remap_expr_columns(*expr, offset)),
+            expr: Box::new(remap_expr_indices(*expr, f)),
             list,
             negated,
         },
@@ -921,11 +1142,15 @@ pub fn remap_expr_columns(expr: Expr, offset: i64) -> Expr {
             pattern,
             negated,
         } => Expr::Like {
-            expr: Box::new(remap_expr_columns(*expr, offset)),
+            expr: Box::new(remap_expr_indices(*expr, f)),
             pattern,
             negated,
         },
     }
+}
+
+pub fn remap_expr_columns(expr: Expr, offset: i64) -> Expr {
+    remap_expr_indices(expr, &|idx| (idx as i64 + offset) as usize)
 }
 
 // ============================================================================
@@ -1192,9 +1417,14 @@ fn reorder_inner_join_cluster(
 
     // If there were any unattached filters, apply them on top before projection
     if let Some(pred) = combine_expr_conjuncts(filters) {
+        let orig_to_new = |orig_idx: usize| -> usize {
+            let (leaf_idx, local_col) = find_leaf_and_col(orig_idx);
+            new_leaf_offsets[leaf_idx] + local_col
+        };
+        let remapped_pred = remap_expr_indices(pred, &orig_to_new);
         current_plan = LogicalPlan::Filter {
             input: Box::new(current_plan),
-            predicate: pred,
+            predicate: remapped_pred,
         };
     }
 

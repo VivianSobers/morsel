@@ -246,3 +246,128 @@ fn output_names_match_aliases() {
     assert_eq!(schema.fields[0].name, "col_a");
     assert_eq!(schema.fields[1].name, "col_b");
 }
+
+#[test]
+fn test_numeric_coercion_comparison_and_arithmetic() {
+    let cat = MockCatalog::new();
+    let sql = "SELECT l_quantity > 300, l_extendedprice * 2 FROM lineitem";
+    let plan = plan_sql(sql, &cat).expect("plan comparison and arithmetic");
+    if let LogicalPlan::Project { exprs, .. } = plan {
+        assert_eq!(exprs.len(), 2);
+        // l_quantity > 300 -> 300 is cast to Decimal{precision: 38, scale: 0}
+        if let Expr::Binary { op, left: _, right } = &exprs[0].0 {
+            assert_eq!(*op, BinOp::Gt);
+            assert!(
+                matches!(
+                    &**right,
+                    Expr::Cast {
+                        to: DataType::Decimal {
+                            precision: 38,
+                            scale: 0
+                        },
+                        ..
+                    }
+                ),
+                "expected Cast to Decimal scale 0, got {:?}",
+                right
+            );
+        } else {
+            panic!("expected Binary op for expr 0");
+        }
+        // l_extendedprice * 2 -> 2 is cast to Decimal{precision: 38, scale: 0}
+        if let Expr::Binary { op, left: _, right } = &exprs[1].0 {
+            assert_eq!(*op, BinOp::Mul);
+            assert!(
+                matches!(
+                    &**right,
+                    Expr::Cast {
+                        to: DataType::Decimal {
+                            precision: 38,
+                            scale: 0
+                        },
+                        ..
+                    }
+                ),
+                "expected Cast to Decimal scale 0, got {:?}",
+                right
+            );
+        } else {
+            panic!("expected Binary op for expr 1");
+        }
+    } else {
+        panic!("expected Project plan");
+    }
+}
+
+#[test]
+fn test_numeric_coercion_case_and_in_list() {
+    let cat = MockCatalog::new();
+    let sql = "SELECT CASE WHEN l_linenumber = 1 THEN l_extendedprice ELSE 0 END, l_extendedprice IN (10, 20) FROM lineitem";
+    let plan = plan_sql(sql, &cat).expect("plan case and in list");
+    if let LogicalPlan::Project { exprs, .. } = plan {
+        assert_eq!(exprs.len(), 2);
+        // CASE branch else (0) should be cast to Decimal{precision: 38, scale: 2}
+        if let Expr::Case { else_expr, .. } = &exprs[0].0 {
+            assert!(else_expr.is_some());
+            let el = else_expr.as_ref().unwrap();
+            assert!(
+                matches!(
+                    &**el,
+                    Expr::Cast {
+                        to: DataType::Decimal {
+                            precision: 38,
+                            scale: 2
+                        },
+                        ..
+                    }
+                ),
+                "expected else to be cast to Decimal scale 2, got {:?}",
+                el
+            );
+        } else {
+            panic!("expected Case expression");
+        }
+        // IN list items should be scaled to Decimal(1000, 2) and Decimal(2000, 2)
+        if let Expr::InList { list, .. } = &exprs[1].0 {
+            assert_eq!(list.len(), 2);
+            assert_eq!(list[0], Scalar::Decimal(1000, 2));
+            assert_eq!(list[1], Scalar::Decimal(2000, 2));
+        } else {
+            panic!("expected InList expression");
+        }
+    } else {
+        panic!("expected Project plan");
+    }
+}
+
+#[test]
+fn test_numeric_coercion_coalesce() {
+    let cat = MockCatalog::new();
+    let sql = "SELECT coalesce(l_extendedprice, 0) FROM lineitem";
+    let plan = plan_sql(sql, &cat).expect("plan coalesce");
+    if let LogicalPlan::Project { exprs, .. } = plan {
+        assert_eq!(exprs.len(), 1);
+        if let Expr::Case { else_expr, .. } = &exprs[0].0 {
+            assert!(else_expr.is_some());
+            let el = else_expr.as_ref().unwrap();
+            assert!(
+                matches!(
+                    &**el,
+                    Expr::Cast {
+                        to: DataType::Decimal {
+                            precision: 38,
+                            scale: 2
+                        },
+                        ..
+                    }
+                ),
+                "expected coalesce else to be cast to Decimal scale 2, got {:?}",
+                el
+            );
+        } else {
+            panic!("expected Case expression for coalesce");
+        }
+    } else {
+        panic!("expected Project plan");
+    }
+}

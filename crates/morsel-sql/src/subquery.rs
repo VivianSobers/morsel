@@ -569,8 +569,14 @@ pub(crate) fn decorrelate_having(
                     right: Box::new(sub_plan),
                 };
 
-                let b_other =
-                    crate::bind::rewrite_post_agg_expr(other_expr, group_exprs, aggs, binder_ctx)?;
+                let cur_schema = cur_plan.schema()?;
+                let b_other = crate::bind::rewrite_post_agg_expr(
+                    other_expr,
+                    group_exprs,
+                    aggs,
+                    binder_ctx,
+                    &cur_schema,
+                )?;
                 let sub_col = Expr::Column(left_len);
                 let bin_op = crate::bind::map_bin_op(op)?;
                 let (final_l, final_r) = if sub_is_right {
@@ -578,7 +584,6 @@ pub(crate) fn decorrelate_having(
                 } else {
                     (sub_col, b_other)
                 };
-                let cur_schema = cur_plan.schema()?;
                 let (final_l, final_r) =
                     crate::bind::coerce_for_cmp(final_l, final_r, &cur_schema)?;
                 bound_conjuncts.push(Expr::Binary {
@@ -590,7 +595,14 @@ pub(crate) fn decorrelate_having(
             }
         }
 
-        let bound = crate::bind::rewrite_post_agg_expr(&conjunct, group_exprs, aggs, binder_ctx)?;
+        let cur_schema = cur_plan.schema()?;
+        let bound = crate::bind::rewrite_post_agg_expr(
+            &conjunct,
+            group_exprs,
+            aggs,
+            binder_ctx,
+            &cur_schema,
+        )?;
         bound_conjuncts.push(bound);
     }
 

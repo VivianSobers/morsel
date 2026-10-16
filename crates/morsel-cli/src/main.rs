@@ -175,11 +175,69 @@ fn append_timing_line(path: &Path, timing: &TimingLine) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn print_plan(plan: &morsel_plan::LogicalPlan, indent: usize) {
+    let pad = "  ".repeat(indent);
+    match plan {
+        morsel_plan::LogicalPlan::Scan { table, columns, .. } => {
+            println!("{}Scan: {} cols={:?}", pad, table, columns);
+        }
+        morsel_plan::LogicalPlan::Filter { input, predicate } => {
+            println!("{}Filter: {:?}", pad, predicate);
+            print_plan(input, indent + 1);
+        }
+        morsel_plan::LogicalPlan::Project { input, exprs } => {
+            let names: Vec<&str> = exprs.iter().map(|(_, name)| name.as_str()).collect();
+            println!("{}Project: {:?}", pad, names);
+            print_plan(input, indent + 1);
+        }
+        morsel_plan::LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggs,
+        } => {
+            let gb_names: Vec<&str> = group_by.iter().map(|(_, name)| name.as_str()).collect();
+            let agg_names: Vec<&str> = aggs.iter().map(|(_, name)| name.as_str()).collect();
+            println!(
+                "{}Aggregate: group_by={:?} aggs={:?}",
+                pad, gb_names, agg_names
+            );
+            print_plan(input, indent + 1);
+        }
+        morsel_plan::LogicalPlan::Join {
+            left,
+            right,
+            join_type,
+            on,
+            filter,
+        } => {
+            println!(
+                "{}Join: {:?} on={:?} filter={:?}",
+                pad, join_type, on, filter
+            );
+            print_plan(left, indent + 1);
+            print_plan(right, indent + 1);
+        }
+        morsel_plan::LogicalPlan::CrossJoin { left, right } => {
+            println!("{}CrossJoin", pad);
+            print_plan(left, indent + 1);
+            print_plan(right, indent + 1);
+        }
+        morsel_plan::LogicalPlan::Sort { input, keys } => {
+            println!("{}Sort: {} keys", pad, keys.len());
+            print_plan(input, indent + 1);
+        }
+        morsel_plan::LogicalPlan::Limit { input, n } => {
+            println!("{}Limit: {}", pad, n);
+            print_plan(input, indent + 1);
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         error_exit(
-            "Usage: morsel query --data DIR --sql-file FILE [--threads T] [--out FILE.csv] [--repeat N] [--timing-json FILE]",
+            "Usage: morsel query --data DIR --sql-file FILE [--threads T] [--out FILE.csv] [--repeat N] [--timing-json FILE] [--explain]",
         );
     }
 
@@ -193,10 +251,14 @@ fn main() {
     let mut out_file: Option<PathBuf> = None;
     let mut repeat: usize = 1;
     let mut timing_json: Option<PathBuf> = None;
+    let mut explain = false;
 
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
+            "--explain" => {
+                explain = true;
+            }
             "--data" => {
                 i += 1;
                 if i >= args.len() {
@@ -298,11 +360,29 @@ fn main() {
     };
     let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
 
+    let stats: std::collections::HashMap<String, usize> = catalog
+        .tables
+        .iter()
+        .map(|(k, v)| (k.clone(), v.rows))
+        .collect();
+
+    if explain {
+        let plan = run_stage("plan", || {
+            let unopt = morsel_sql::plan_sql(&sql_str, &catalog)?;
+            morsel_sql::optimize(unopt, &stats)
+        });
+        print_plan(&plan, 0);
+        std::process::exit(0);
+    }
+
     let mut last_result: Option<(Schema, Vec<Batch>)> = None;
 
     for _ in 0..repeat {
         let plan_start = Instant::now();
-        let plan = run_stage("plan", || morsel_sql::plan_sql(&sql_str, &catalog));
+        let plan = run_stage("plan", || {
+            let unopt = morsel_sql::plan_sql(&sql_str, &catalog)?;
+            morsel_sql::optimize(unopt, &stats)
+        });
         let plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
 
         let exec_start = Instant::now();
