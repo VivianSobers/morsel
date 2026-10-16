@@ -4,8 +4,14 @@ use morsel_core::{Batch, Column, ColumnData, DataType, Scalar};
 use morsel_plan::{binary_op_type, BinOp, DateField, Expr};
 use regex::Regex;
 
+fn checked_pow10(n: u8) -> Result<i128> {
+    10i128
+        .checked_pow(n as u32)
+        .ok_or_else(|| anyhow::anyhow!("decimal power overflow: 10^{}", n))
+}
+
 fn pow10(n: u8) -> i128 {
-    10i128.pow(n as u32)
+    checked_pow10(n).unwrap_or(i128::MAX)
 }
 
 fn like_to_regex(pattern: &str) -> Result<Regex> {
@@ -338,10 +344,18 @@ fn cast_column(col: &Column, to: DataType) -> Result<Column> {
             let val = col.get(i);
             let casted = match (val, to) {
                 (Scalar::Int32(x), DataType::Decimal { scale, .. }) => {
-                    Scalar::Decimal(x as i128 * pow10(scale), scale)
+                    let p = checked_pow10(scale)?;
+                    let v = (x as i128)
+                        .checked_mul(p)
+                        .ok_or_else(|| anyhow::anyhow!("decimal cast overflow"))?;
+                    Scalar::Decimal(v, scale)
                 }
                 (Scalar::Int64(x), DataType::Decimal { scale, .. }) => {
-                    Scalar::Decimal(x as i128 * pow10(scale), scale)
+                    let p = checked_pow10(scale)?;
+                    let v = (x as i128)
+                        .checked_mul(p)
+                        .ok_or_else(|| anyhow::anyhow!("decimal cast overflow"))?;
+                    Scalar::Decimal(v, scale)
                 }
                 (
                     Scalar::Decimal(x, s),
@@ -350,9 +364,14 @@ fn cast_column(col: &Column, to: DataType) -> Result<Column> {
                     },
                 ) => {
                     if target_s >= s {
-                        Scalar::Decimal(x * pow10(target_s - s), target_s)
+                        let p = checked_pow10(target_s - s)?;
+                        let v = x
+                            .checked_mul(p)
+                            .ok_or_else(|| anyhow::anyhow!("decimal cast overflow"))?;
+                        Scalar::Decimal(v, target_s)
                     } else {
-                        Scalar::Decimal(x / pow10(s - target_s), target_s)
+                        let p = checked_pow10(s - target_s)?;
+                        Scalar::Decimal(x / p, target_s)
                     }
                 }
                 (Scalar::Int32(x), DataType::Int64) => Scalar::Int64(x as i64),
@@ -561,45 +580,158 @@ fn eval_arithmetic(op: BinOp, left: &Column, right: &Column, len: usize) -> Resu
                 (Scalar::Decimal(v1, s1), Scalar::Decimal(v2, s2)) => match op {
                     BinOp::Add => {
                         let s = s1.max(s2);
-                        let r1 = v1 * pow10(s - s1);
-                        let r2 = v2 * pow10(s - s2);
-                        Scalar::Decimal(r1 + r2, s)
+                        let p1 = checked_pow10(s - s1)?;
+                        let p2 = checked_pow10(s - s2)?;
+                        let r1 = v1
+                            .checked_mul(p1)
+                            .ok_or_else(|| anyhow::anyhow!("decimal addition overflow"))?;
+                        let r2 = v2
+                            .checked_mul(p2)
+                            .ok_or_else(|| anyhow::anyhow!("decimal addition overflow"))?;
+                        let sum = r1
+                            .checked_add(r2)
+                            .ok_or_else(|| anyhow::anyhow!("decimal addition overflow"))?;
+                        Scalar::Decimal(sum, s)
                     }
                     BinOp::Sub => {
                         let s = s1.max(s2);
-                        let r1 = v1 * pow10(s - s1);
-                        let r2 = v2 * pow10(s - s2);
-                        Scalar::Decimal(r1 - r2, s)
+                        let p1 = checked_pow10(s - s1)?;
+                        let p2 = checked_pow10(s - s2)?;
+                        let r1 = v1
+                            .checked_mul(p1)
+                            .ok_or_else(|| anyhow::anyhow!("decimal subtraction overflow"))?;
+                        let r2 = v2
+                            .checked_mul(p2)
+                            .ok_or_else(|| anyhow::anyhow!("decimal subtraction overflow"))?;
+                        let diff = r1
+                            .checked_sub(r2)
+                            .ok_or_else(|| anyhow::anyhow!("decimal subtraction overflow"))?;
+                        Scalar::Decimal(diff, s)
                     }
                     BinOp::Mul => {
                         let s = s1 + s2;
-                        Scalar::Decimal(v1 * v2, s)
+                        let prod = v1
+                            .checked_mul(v2)
+                            .ok_or_else(|| anyhow::anyhow!("decimal multiplication overflow"))?;
+                        Scalar::Decimal(prod, s)
                     }
                     _ => unreachable!(),
                 },
                 // Integer op Decimal
                 (Scalar::Int32(x), Scalar::Decimal(v, s)) => match op {
-                    BinOp::Add => Scalar::Decimal(x as i128 * pow10(s) + v, s),
-                    BinOp::Sub => Scalar::Decimal(x as i128 * pow10(s) - v, s),
-                    BinOp::Mul => Scalar::Decimal(x as i128 * v, s),
+                    BinOp::Add => {
+                        let p = checked_pow10(s)?;
+                        let scaled = (x as i128)
+                            .checked_mul(p)
+                            .ok_or_else(|| anyhow::anyhow!("decimal addition overflow"))?;
+                        let sum = scaled
+                            .checked_add(v)
+                            .ok_or_else(|| anyhow::anyhow!("decimal addition overflow"))?;
+                        Scalar::Decimal(sum, s)
+                    }
+                    BinOp::Sub => {
+                        let p = checked_pow10(s)?;
+                        let scaled = (x as i128)
+                            .checked_mul(p)
+                            .ok_or_else(|| anyhow::anyhow!("decimal subtraction overflow"))?;
+                        let diff = scaled
+                            .checked_sub(v)
+                            .ok_or_else(|| anyhow::anyhow!("decimal subtraction overflow"))?;
+                        Scalar::Decimal(diff, s)
+                    }
+                    BinOp::Mul => {
+                        let prod = (x as i128)
+                            .checked_mul(v)
+                            .ok_or_else(|| anyhow::anyhow!("decimal multiplication overflow"))?;
+                        Scalar::Decimal(prod, s)
+                    }
                     _ => unreachable!(),
                 },
                 (Scalar::Decimal(v, s), Scalar::Int32(x)) => match op {
-                    BinOp::Add => Scalar::Decimal(v + x as i128 * pow10(s), s),
-                    BinOp::Sub => Scalar::Decimal(v - x as i128 * pow10(s), s),
-                    BinOp::Mul => Scalar::Decimal(v * x as i128, s),
+                    BinOp::Add => {
+                        let p = checked_pow10(s)?;
+                        let scaled = (x as i128)
+                            .checked_mul(p)
+                            .ok_or_else(|| anyhow::anyhow!("decimal addition overflow"))?;
+                        let sum = v
+                            .checked_add(scaled)
+                            .ok_or_else(|| anyhow::anyhow!("decimal addition overflow"))?;
+                        Scalar::Decimal(sum, s)
+                    }
+                    BinOp::Sub => {
+                        let p = checked_pow10(s)?;
+                        let scaled = (x as i128)
+                            .checked_mul(p)
+                            .ok_or_else(|| anyhow::anyhow!("decimal subtraction overflow"))?;
+                        let diff = v
+                            .checked_sub(scaled)
+                            .ok_or_else(|| anyhow::anyhow!("decimal subtraction overflow"))?;
+                        Scalar::Decimal(diff, s)
+                    }
+                    BinOp::Mul => {
+                        let prod = v
+                            .checked_mul(x as i128)
+                            .ok_or_else(|| anyhow::anyhow!("decimal multiplication overflow"))?;
+                        Scalar::Decimal(prod, s)
+                    }
                     _ => unreachable!(),
                 },
                 (Scalar::Int64(x), Scalar::Decimal(v, s)) => match op {
-                    BinOp::Add => Scalar::Decimal(x as i128 * pow10(s) + v, s),
-                    BinOp::Sub => Scalar::Decimal(x as i128 * pow10(s) - v, s),
-                    BinOp::Mul => Scalar::Decimal(x as i128 * v, s),
+                    BinOp::Add => {
+                        let p = checked_pow10(s)?;
+                        let scaled = (x as i128)
+                            .checked_mul(p)
+                            .ok_or_else(|| anyhow::anyhow!("decimal addition overflow"))?;
+                        let sum = scaled
+                            .checked_add(v)
+                            .ok_or_else(|| anyhow::anyhow!("decimal addition overflow"))?;
+                        Scalar::Decimal(sum, s)
+                    }
+                    BinOp::Sub => {
+                        let p = checked_pow10(s)?;
+                        let scaled = (x as i128)
+                            .checked_mul(p)
+                            .ok_or_else(|| anyhow::anyhow!("decimal subtraction overflow"))?;
+                        let diff = scaled
+                            .checked_sub(v)
+                            .ok_or_else(|| anyhow::anyhow!("decimal subtraction overflow"))?;
+                        Scalar::Decimal(diff, s)
+                    }
+                    BinOp::Mul => {
+                        let prod = (x as i128)
+                            .checked_mul(v)
+                            .ok_or_else(|| anyhow::anyhow!("decimal multiplication overflow"))?;
+                        Scalar::Decimal(prod, s)
+                    }
                     _ => unreachable!(),
                 },
                 (Scalar::Decimal(v, s), Scalar::Int64(x)) => match op {
-                    BinOp::Add => Scalar::Decimal(v + x as i128 * pow10(s), s),
-                    BinOp::Sub => Scalar::Decimal(v - x as i128 * pow10(s), s),
-                    BinOp::Mul => Scalar::Decimal(v * x as i128, s),
+                    BinOp::Add => {
+                        let p = checked_pow10(s)?;
+                        let scaled = (x as i128)
+                            .checked_mul(p)
+                            .ok_or_else(|| anyhow::anyhow!("decimal addition overflow"))?;
+                        let sum = v
+                            .checked_add(scaled)
+                            .ok_or_else(|| anyhow::anyhow!("decimal addition overflow"))?;
+                        Scalar::Decimal(sum, s)
+                    }
+                    BinOp::Sub => {
+                        let p = checked_pow10(s)?;
+                        let scaled = (x as i128)
+                            .checked_mul(p)
+                            .ok_or_else(|| anyhow::anyhow!("decimal subtraction overflow"))?;
+                        let diff = v
+                            .checked_sub(scaled)
+                            .ok_or_else(|| anyhow::anyhow!("decimal subtraction overflow"))?;
+                        Scalar::Decimal(diff, s)
+                    }
+                    BinOp::Mul => {
+                        let prod = v
+                            .checked_mul(x as i128)
+                            .ok_or_else(|| anyhow::anyhow!("decimal multiplication overflow"))?;
+                        Scalar::Decimal(prod, s)
+                    }
                     _ => unreachable!(),
                 },
                 // Integer op Integer

@@ -637,3 +637,56 @@ fn all_null_batch_preserves_arithmetic_type() {
         }
     );
 }
+
+#[test]
+fn decimal_mul_overflow_returns_error() {
+    let schema = Arc::new(Schema {
+        fields: vec![
+            Field {
+                name: "a".to_string(),
+                dtype: DataType::Decimal {
+                    precision: 38,
+                    scale: 2,
+                },
+                nullable: false,
+            },
+            Field {
+                name: "b".to_string(),
+                dtype: DataType::Decimal {
+                    precision: 38,
+                    scale: 2,
+                },
+                nullable: false,
+            },
+        ],
+    });
+
+    let batch = Batch::new(
+        schema,
+        vec![
+            Arc::new(Column::from_scalars(
+                DataType::Decimal {
+                    precision: 38,
+                    scale: 2,
+                },
+                &[Scalar::Decimal(10i128.pow(20), 2)],
+            )),
+            Arc::new(Column::from_scalars(
+                DataType::Decimal {
+                    precision: 38,
+                    scale: 2,
+                },
+                &[Scalar::Decimal(10i128.pow(20), 2)],
+            )),
+        ],
+    );
+
+    let expr = Expr::Binary {
+        op: BinOp::Mul,
+        left: Box::new(Expr::Column(0)),
+        right: Box::new(Expr::Column(1)),
+    };
+
+    let res = eval(&expr, &batch);
+    assert!(res.is_err());
+}
