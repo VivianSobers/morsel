@@ -245,6 +245,11 @@ fn output_names_match_aliases() {
     assert_eq!(schema.fields.len(), 2);
     assert_eq!(schema.fields[0].name, "col_a");
     assert_eq!(schema.fields[1].name, "col_b");
+
+    let sql_agg = "SELECT sum(a) FROM t";
+    let plan_agg = plan_sql(sql_agg, &cat).expect("plan unaliased agg");
+    let schema_agg = plan_agg.schema().expect("plan agg schema");
+    assert_eq!(schema_agg.fields[0].name, "sum(a)");
 }
 
 #[test]

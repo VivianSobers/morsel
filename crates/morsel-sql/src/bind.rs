@@ -2114,7 +2114,7 @@ fn expr_default_name(expr: &sql::Expr, fallback: &str) -> String {
             .last()
             .map(|p| p.value.clone())
             .unwrap_or_else(|| fallback.to_string()),
-        sql::Expr::Function(func) => func.name.to_string(),
+        sql::Expr::Function(func) => func.to_string(),
         _ => fallback.to_string(),
     }
 }
