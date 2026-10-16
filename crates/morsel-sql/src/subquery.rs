@@ -438,52 +438,61 @@ pub(crate) fn decorrelate_where(
                             right: Box::new(final_r),
                         });
                     } else {
-                        let (outer_key, inner_key) = equi_on[0].clone();
                         let mut modified_subquery = (*subquery).clone();
+
+                        let inner_group_by_exprs: Vec<sql::Expr> =
+                            equi_on.iter().map(|(_, inner)| inner.clone()).collect();
+                        let mut proj_items: Vec<sql::SelectItem> = inner_group_by_exprs
+                            .iter()
+                            .map(|e| sql::SelectItem::UnnamedExpr(e.clone()))
+                            .collect();
 
                         if let sql::SetExpr::Select(ref mut s) = *modified_subquery.body {
                             s.selection = combine_conjuncts(inner_filter_conjuncts);
                             s.group_by =
-                                sql::GroupByExpr::Expressions(vec![inner_key.clone()], vec![]);
+                                sql::GroupByExpr::Expressions(inner_group_by_exprs, vec![]);
                             let orig_scalar_expr = match &s.projection[0] {
                                 sql::SelectItem::UnnamedExpr(e)
                                 | sql::SelectItem::ExprWithAlias { expr: e, .. } => e.clone(),
                                 other => bail!("unexpected subquery projection: {:?}", other),
                             };
-                            s.projection = vec![
-                                sql::SelectItem::UnnamedExpr(inner_key.clone()),
-                                sql::SelectItem::ExprWithAlias {
-                                    expr: orig_scalar_expr,
-                                    alias: sql::Ident::new("agg_val"),
-                                },
-                            ];
+                            proj_items.push(sql::SelectItem::ExprWithAlias {
+                                expr: orig_scalar_expr,
+                                alias: sql::Ident::new("agg_val"),
+                            });
+                            s.projection = proj_items;
                         }
 
                         let sub_plan = bind_query(&modified_subquery, schemas, ctes)?;
                         let sub_schema = sub_plan.schema()?;
-                        let l_bound = binder_ctx.bind_expr(&outer_key)?;
 
-                        let r_idx = match &inner_key {
-                            sql::Expr::Identifier(ident) => {
-                                sub_schema.index_of(&ident.value).unwrap_or(0)
-                            }
-                            sql::Expr::CompoundIdentifier(parts) => {
-                                sub_schema.index_of(&parts[1].value).unwrap_or(0)
-                            }
-                            _ => 0,
-                        };
+                        let mut bound_on = Vec::with_capacity(equi_on.len());
+                        for (i, (outer_key, inner_key)) in equi_on.iter().enumerate() {
+                            let l_bound = binder_ctx.bind_expr(outer_key)?;
+                            let r_idx = match inner_key {
+                                sql::Expr::Identifier(ident) => {
+                                    sub_schema.index_of(&ident.value).unwrap_or(i)
+                                }
+                                sql::Expr::CompoundIdentifier(parts) => parts
+                                    .last()
+                                    .and_then(|p| sub_schema.index_of(&p.value))
+                                    .unwrap_or(i),
+                                _ => i,
+                            };
+                            bound_on.push((l_bound, Expr::Column(r_idx)));
+                        }
 
                         let left_len = current_plan.schema()?.len();
                         current_plan = LogicalPlan::Join {
                             left: Box::new(current_plan),
                             right: Box::new(sub_plan),
                             join_type: JoinType::Inner,
-                            on: vec![(l_bound, Expr::Column(r_idx))],
+                            on: bound_on,
                             filter: None,
                         };
 
                         let b_other = binder_ctx.bind_expr(other_expr)?;
-                        let agg_val_col = Expr::Column(left_len + 1);
+                        let agg_val_col = Expr::Column(left_len + equi_on.len());
                         let bin_op = map_bin_op(op)?;
                         let (final_l, final_r) = if sub_is_right {
                             (b_other, agg_val_col)

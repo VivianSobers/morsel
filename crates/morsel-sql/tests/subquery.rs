@@ -290,3 +290,56 @@ fn correlated_scalar_becomes_agg_join() {
         plan
     );
 }
+
+#[test]
+fn test_correlated_scalar_multiple_keys_decorrelates() {
+    let mut cat = SubqueryMockCatalog::new();
+    cat.schemas.insert(
+        "partsupp".to_string(),
+        Schema::new(vec![
+            Field {
+                name: "ps_partkey".into(),
+                dtype: DataType::Int64,
+                nullable: false,
+            },
+            Field {
+                name: "ps_suppkey".into(),
+                dtype: DataType::Int64,
+                nullable: false,
+            },
+            Field {
+                name: "ps_availqty".into(),
+                dtype: DataType::Int64,
+                nullable: false,
+            },
+        ]),
+    );
+    let sql = "SELECT ps_suppkey FROM partsupp WHERE ps_availqty > (SELECT 0.5 * sum(l_quantity) FROM lineitem WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey)";
+    let plan = plan_sql(sql, &cat).expect("plan q20 correlated scalar subquery");
+
+    fn find_join_key_count(plan: &LogicalPlan) -> Option<usize> {
+        match plan {
+            LogicalPlan::Join {
+                on, left, right, ..
+            } => {
+                if !on.is_empty() {
+                    Some(on.len())
+                } else {
+                    find_join_key_count(left).or_else(|| find_join_key_count(right))
+                }
+            }
+            LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Project { input, .. }
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. } => find_join_key_count(input),
+            _ => None,
+        }
+    }
+    assert_eq!(
+        find_join_key_count(&plan),
+        Some(2),
+        "should join on both correlation keys: {:?}",
+        plan
+    );
+}

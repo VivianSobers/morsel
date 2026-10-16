@@ -3,7 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use morsel_core::{DataType, Field, Schema};
-use morsel_plan::{LogicalPlan, SchemaProvider};
+use morsel_plan::{JoinType, LogicalPlan, SchemaProvider};
 use morsel_sql::{optimize, plan_sql};
 
 struct MockCatalog {
@@ -574,10 +574,6 @@ fn no_cross_join_has_base_scans_on_both_sides() {
     let root = repo_root();
 
     for q in 1..=22 {
-        if q == 19 {
-            // Q19 join predicate is nested inside OR branches, resolved in Task B10
-            continue;
-        }
         let sql_path = root.join("queries/tpch").join(format!("q{:02}.sql", q));
         let sql = fs::read_to_string(&sql_path)
             .unwrap_or_else(|e| panic!("failed to read {:?}: {}", sql_path, e));
@@ -608,18 +604,68 @@ fn test_optimizer_steps_preserve_schema_and_column_ranges() {
         let folded = morsel_sql::optimize::fold_constants(raw_plan).unwrap();
         morsel_sql::optimize::check_optimizer_step("fold_constants", &folded, &raw_schema).unwrap();
 
-        // 2. Push predicates
-        let pushed = morsel_sql::optimize::push_predicates(folded).unwrap();
+        // 2. Factor disjunctions
+        let factored = morsel_sql::optimize::factor_disjunctions(folded).unwrap();
+        morsel_sql::optimize::check_optimizer_step("factor_disjunctions", &factored, &raw_schema)
+            .unwrap();
+
+        // 3. Push predicates
+        let pushed = morsel_sql::optimize::push_predicates(factored).unwrap();
         morsel_sql::optimize::check_optimizer_step("push_predicates", &pushed, &raw_schema)
             .unwrap();
 
-        // 3. Order joins
+        // 4. Order joins
         let ordered = morsel_sql::optimize::order_joins(pushed, &stats).unwrap();
         morsel_sql::optimize::check_optimizer_step("order_joins", &ordered, &raw_schema).unwrap();
 
-        // 4. Prune projections
+        // 5. Prune projections
         let pruned = morsel_sql::optimize::prune_projections(ordered).unwrap();
         morsel_sql::optimize::check_optimizer_step("prune_projections", &pruned, &raw_schema)
             .unwrap();
     }
+}
+
+#[test]
+fn test_or_factoring_q19_plan_level() {
+    let catalog = tpch_schemas();
+    let stats = tpch_stats();
+    let root = repo_root();
+
+    let sql_path = root.join("queries/tpch/q19.sql");
+    let sql = fs::read_to_string(&sql_path).expect("read q19.sql");
+    let raw_plan = plan_sql(&sql, &catalog).expect("plan q19");
+
+    // After factoring disjunctions, the filter should have the common join key factored out
+    let factored = morsel_sql::optimize::factor_disjunctions(raw_plan).expect("factor q19");
+
+    // Verify optimized plan has an Inner Join with non-empty on keys (no CrossJoin)
+    let optimized = optimize(factored, &stats).expect("optimize q19");
+    assert_no_base_cross_join(&optimized, 19);
+
+    fn has_inner_join_with_keys(plan: &LogicalPlan) -> bool {
+        match plan {
+            LogicalPlan::Join {
+                join_type,
+                on,
+                left,
+                right,
+                ..
+            } => {
+                (*join_type == JoinType::Inner && !on.is_empty())
+                    || has_inner_join_with_keys(left)
+                    || has_inner_join_with_keys(right)
+            }
+            LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Project { input, .. }
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. } => has_inner_join_with_keys(input),
+            _ => false,
+        }
+    }
+
+    assert!(
+        has_inner_join_with_keys(&optimized),
+        "optimized Q19 plan must have inner join with join keys"
+    );
 }

@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{bail, Result};
 use chrono::{Datelike, Duration, NaiveDate};
 use morsel_core::{DataType, Scalar, Schema};
-use morsel_plan::{BinOp, Expr, JoinType, LogicalPlan, SortKey};
+use morsel_plan::{AggExpr, BinOp, Expr, JoinType, LogicalPlan, SortKey};
 use regex::Regex;
 
 pub fn optimize(plan: LogicalPlan, stats: &HashMap<String, usize>) -> Result<LogicalPlan> {
@@ -14,15 +14,19 @@ pub fn optimize(plan: LogicalPlan, stats: &HashMap<String, usize>) -> Result<Log
     let plan = fold_constants(plan)?;
     check_optimizer_step("fold_constants", &plan, &root_schema)?;
 
-    // 2. Predicate pushdown (pushes filters through projections, aggregates, down into join sides and to scans)
+    // 2. OR factoring (factor common terms out of disjunctions)
+    let plan = factor_disjunctions(plan)?;
+    check_optimizer_step("factor_disjunctions", &plan, &root_schema)?;
+
+    // 3. Predicate pushdown (pushes filters through projections, aggregates, down into join sides and to scans)
     let plan = push_predicates(plan)?;
     check_optimizer_step("push_predicates", &plan, &root_schema)?;
 
-    // 3. Join ordering (greedy by estimated rows from stats, turns comma joins into hash joins)
+    // 4. Join ordering (greedy by estimated rows from stats, turns comma joins into hash joins)
     let plan = order_joins(plan, stats)?;
     check_optimizer_step("order_joins", &plan, &root_schema)?;
 
-    // 4. Projection pruning
+    // 5. Projection pruning
     // Base table columns are already pruned down to scans by bind.rs
     let plan = prune_projections(plan)?;
     check_optimizer_step("prune_projections", &plan, &root_schema)?;
@@ -628,7 +632,293 @@ fn like_to_regex(pattern: &str) -> Option<Regex> {
 }
 
 // ============================================================================
-// 2. Predicate Pushdown
+// 2. OR Factoring
+// ============================================================================
+
+pub fn factor_disjunctions(plan: LogicalPlan) -> Result<LogicalPlan> {
+    match plan {
+        LogicalPlan::Scan { .. } => Ok(plan),
+        LogicalPlan::Filter { input, predicate } => {
+            let opt_input = factor_disjunctions(*input)?;
+            let factored_predicate = factor_expr_disjunctions(predicate);
+            Ok(LogicalPlan::Filter {
+                input: Box::new(opt_input),
+                predicate: factored_predicate,
+            })
+        }
+        LogicalPlan::Project { input, exprs } => {
+            let opt_input = factor_disjunctions(*input)?;
+            let factored_exprs = exprs
+                .into_iter()
+                .map(|(e, name)| (factor_expr_disjunctions(e), name))
+                .collect();
+            Ok(LogicalPlan::Project {
+                input: Box::new(opt_input),
+                exprs: factored_exprs,
+            })
+        }
+        LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggs,
+        } => {
+            let opt_input = factor_disjunctions(*input)?;
+            let factored_group_by = group_by
+                .into_iter()
+                .map(|(e, name)| (factor_expr_disjunctions(e), name))
+                .collect();
+            let factored_aggs = aggs
+                .into_iter()
+                .map(|(agg, name)| {
+                    (
+                        AggExpr {
+                            func: agg.func,
+                            arg: agg.arg.map(factor_expr_disjunctions),
+                        },
+                        name,
+                    )
+                })
+                .collect();
+            Ok(LogicalPlan::Aggregate {
+                input: Box::new(opt_input),
+                group_by: factored_group_by,
+                aggs: factored_aggs,
+            })
+        }
+        LogicalPlan::Join {
+            left,
+            right,
+            join_type,
+            on,
+            filter,
+        } => {
+            let opt_left = factor_disjunctions(*left)?;
+            let opt_right = factor_disjunctions(*right)?;
+            let factored_on = on
+                .into_iter()
+                .map(|(l, r)| (factor_expr_disjunctions(l), factor_expr_disjunctions(r)))
+                .collect();
+            let factored_filter = filter.map(factor_expr_disjunctions);
+            Ok(LogicalPlan::Join {
+                left: Box::new(opt_left),
+                right: Box::new(opt_right),
+                join_type,
+                on: factored_on,
+                filter: factored_filter,
+            })
+        }
+        LogicalPlan::CrossJoin { left, right } => {
+            let opt_left = factor_disjunctions(*left)?;
+            let opt_right = factor_disjunctions(*right)?;
+            Ok(LogicalPlan::CrossJoin {
+                left: Box::new(opt_left),
+                right: Box::new(opt_right),
+            })
+        }
+        LogicalPlan::Sort { input, keys } => {
+            let opt_input = factor_disjunctions(*input)?;
+            let factored_keys = keys
+                .into_iter()
+                .map(|k| SortKey {
+                    expr: factor_expr_disjunctions(k.expr),
+                    asc: k.asc,
+                    nulls_first: k.nulls_first,
+                })
+                .collect();
+            Ok(LogicalPlan::Sort {
+                input: Box::new(opt_input),
+                keys: factored_keys,
+            })
+        }
+        LogicalPlan::Limit { input, n } => {
+            let opt_input = factor_disjunctions(*input)?;
+            Ok(LogicalPlan::Limit {
+                input: Box::new(opt_input),
+                n,
+            })
+        }
+    }
+}
+
+pub fn factor_expr_disjunctions(expr: Expr) -> Expr {
+    match expr {
+        Expr::Binary { op, left, right } => {
+            let opt_left = factor_expr_disjunctions(*left);
+            let opt_right = factor_expr_disjunctions(*right);
+            if op == BinOp::Or {
+                factor_or(Expr::Binary {
+                    op,
+                    left: Box::new(opt_left),
+                    right: Box::new(opt_right),
+                })
+            } else {
+                Expr::Binary {
+                    op,
+                    left: Box::new(opt_left),
+                    right: Box::new(opt_right),
+                }
+            }
+        }
+        Expr::Not(sub) => Expr::Not(Box::new(factor_expr_disjunctions(*sub))),
+        Expr::Negate(sub) => Expr::Negate(Box::new(factor_expr_disjunctions(*sub))),
+        Expr::IsNull(sub) => Expr::IsNull(Box::new(factor_expr_disjunctions(*sub))),
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+        } => Expr::Like {
+            expr: Box::new(factor_expr_disjunctions(*expr)),
+            pattern,
+            negated,
+        },
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: Box::new(factor_expr_disjunctions(*expr)),
+            list,
+            negated,
+        },
+        Expr::Case { whens, else_expr } => Expr::Case {
+            whens: whens
+                .into_iter()
+                .map(|(c, r)| (factor_expr_disjunctions(c), factor_expr_disjunctions(r)))
+                .collect(),
+            else_expr: else_expr.map(|e| Box::new(factor_expr_disjunctions(*e))),
+        },
+        Expr::Cast { expr, to } => Expr::Cast {
+            expr: Box::new(factor_expr_disjunctions(*expr)),
+            to,
+        },
+        Expr::Extract { field, expr } => Expr::Extract {
+            field,
+            expr: Box::new(factor_expr_disjunctions(*expr)),
+        },
+        Expr::Substring { expr, start, len } => Expr::Substring {
+            expr: Box::new(factor_expr_disjunctions(*expr)),
+            start,
+            len,
+        },
+        other => other,
+    }
+}
+
+pub fn split_expr_disjuncts(expr: Expr) -> Vec<Expr> {
+    let mut disjuncts = Vec::new();
+    fn recurse(e: Expr, list: &mut Vec<Expr>) {
+        if let Expr::Binary {
+            op: BinOp::Or,
+            left,
+            right,
+        } = e
+        {
+            recurse(*left, list);
+            recurse(*right, list);
+        } else {
+            list.push(e);
+        }
+    }
+    recurse(expr, &mut disjuncts);
+    disjuncts
+}
+
+pub fn combine_expr_disjuncts(mut disjuncts: Vec<Expr>) -> Expr {
+    if disjuncts.is_empty() {
+        return Expr::Literal(Scalar::Bool(false));
+    }
+    let mut root = disjuncts.remove(0);
+    for next in disjuncts {
+        root = Expr::Binary {
+            op: BinOp::Or,
+            left: Box::new(root),
+            right: Box::new(next),
+        };
+    }
+    root
+}
+
+pub fn expr_equiv(a: &Expr, b: &Expr) -> bool {
+    if a == b {
+        return true;
+    }
+    if let (
+        Expr::Binary {
+            op: op1,
+            left: l1,
+            right: r1,
+        },
+        Expr::Binary {
+            op: op2,
+            left: l2,
+            right: r2,
+        },
+    ) = (a, b)
+    {
+        if op1 == op2 && matches!(op1, BinOp::Eq | BinOp::NotEq) {
+            return (expr_equiv(l1, l2) && expr_equiv(r1, r2))
+                || (expr_equiv(l1, r2) && expr_equiv(r1, l2));
+        }
+    }
+    false
+}
+
+fn factor_or(expr: Expr) -> Expr {
+    let disjuncts = split_expr_disjuncts(expr);
+    if disjuncts.len() <= 1 {
+        return disjuncts.into_iter().next().unwrap();
+    }
+
+    let mut branch_conjuncts: Vec<Vec<Expr>> =
+        disjuncts.into_iter().map(split_expr_conjuncts).collect();
+
+    let first_branch = branch_conjuncts[0].clone();
+    let mut common_conjuncts = Vec::new();
+
+    for candidate in first_branch {
+        let in_all = branch_conjuncts[1..]
+            .iter()
+            .all(|branch| branch.iter().any(|item| expr_equiv(item, &candidate)));
+        if in_all {
+            for branch in &mut branch_conjuncts {
+                if let Some(pos) = branch.iter().position(|item| expr_equiv(item, &candidate)) {
+                    branch.remove(pos);
+                }
+            }
+            common_conjuncts.push(candidate);
+        }
+    }
+
+    if common_conjuncts.is_empty() {
+        let mut rest_branches = Vec::new();
+        for branch in branch_conjuncts {
+            if let Some(p) = combine_expr_conjuncts(branch) {
+                rest_branches.push(p);
+            } else {
+                rest_branches.push(Expr::Literal(Scalar::Bool(true)));
+            }
+        }
+        return combine_expr_disjuncts(rest_branches);
+    }
+
+    let mut rest_branches = Vec::new();
+    for branch in branch_conjuncts {
+        if let Some(p) = combine_expr_conjuncts(branch) {
+            rest_branches.push(p);
+        } else {
+            rest_branches.push(Expr::Literal(Scalar::Bool(true)));
+        }
+    }
+    let rest_or = combine_expr_disjuncts(rest_branches);
+
+    let mut all_conjuncts = common_conjuncts;
+    all_conjuncts.push(rest_or);
+
+    combine_expr_conjuncts(all_conjuncts).unwrap()
+}
+
+// ============================================================================
+// 3. Predicate Pushdown
 // ============================================================================
 
 pub fn push_predicates(plan: LogicalPlan) -> Result<LogicalPlan> {
