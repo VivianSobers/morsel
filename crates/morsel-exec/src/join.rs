@@ -1,4 +1,5 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -9,7 +10,7 @@ use crate::aggregate::{to_key, ScalarKey};
 use crate::catalog::Catalog;
 use crate::eval::{eval, eval_predicate};
 use crate::execute::execute;
-use crate::scheduler::{create_morsels, Morsel};
+use crate::scheduler::create_morsels;
 
 #[derive(Clone, Copy, Debug)]
 pub struct RowLoc {
@@ -161,39 +162,37 @@ pub fn execute_join(
 
     let num_morsels = morsels.len();
     let num_threads = threads.max(1);
-    let queue = Arc::new(Mutex::new(VecDeque::from(morsels)));
-    let results = Arc::new(Mutex::new(vec![Vec::new(); num_morsels]));
-    let error_cell = Arc::new(Mutex::new(None));
-
-    let hash_table = Arc::new(hash_table);
-    let right_batches = Arc::new(right_batches);
+    let next_morsel = AtomicUsize::new(0);
+    let cancelled = AtomicBool::new(false);
+    let results: Vec<Mutex<Vec<Batch>>> =
+        (0..num_morsels).map(|_| Mutex::new(Vec::new())).collect();
+    let error_cell = Mutex::new(None);
 
     std::thread::scope(|s| {
         for _ in 0..num_threads {
-            let q = Arc::clone(&queue);
-            let res = Arc::clone(&results);
-            let err_cell = Arc::clone(&error_cell);
-            let ht = Arc::clone(&hash_table);
-            let r_batches = Arc::clone(&right_batches);
-            let out_sch = Arc::clone(&out_schema);
-            let comb_sch = Arc::clone(&combined_schema);
+            let next_ref = &next_morsel;
+            let morsels_ref = &morsels;
+            let res_ref = &results;
+            let err_cell = &error_cell;
+            let cancelled_ref = &cancelled;
+            let ht = &hash_table;
+            let r_batches = &right_batches;
+            let out_sch = &out_schema;
+            let comb_sch = &combined_schema;
             let l_cols_len = left_schema.fields.len();
             let r_cols_len = right_schema.fields.len();
 
             s.spawn(move || loop {
-                if err_cell.lock().unwrap().is_some() {
+                if cancelled_ref.load(Ordering::Relaxed) {
                     break;
                 }
-                let morsel: Option<Morsel> = {
-                    let mut locked_q = q.lock().unwrap();
-                    locked_q.pop_front()
-                };
-                let morsel = match morsel {
-                    Some(m) => m,
-                    None => break,
-                };
+                let idx = next_ref.fetch_add(1, Ordering::Relaxed);
+                if idx >= num_morsels {
+                    break;
+                }
+                let morsel = &morsels_ref[idx];
 
-                let mut builder = BatchBuilder::new(Arc::clone(&out_sch));
+                let mut builder = BatchBuilder::new(Arc::clone(out_sch));
 
                 for l_batch in &morsel.batches {
                     let l_key_cols: Vec<Column> = match on
@@ -207,6 +206,7 @@ pub fn execute_join(
                             if locked_err.is_none() {
                                 *locked_err = Some(e);
                             }
+                            cancelled_ref.store(true, Ordering::Relaxed);
                             break;
                         }
                     };
@@ -230,7 +230,7 @@ pub fn execute_join(
                                     for &loc in matched_locs {
                                         if let Some(f) = filter {
                                             match test_filter_pair(
-                                                f, l_batch, l_idx, &r_batches, loc, &comb_sch,
+                                                f, l_batch, l_idx, r_batches, loc, comb_sch,
                                             ) {
                                                 Ok(true) => {}
                                                 Ok(false) => continue,
@@ -239,6 +239,7 @@ pub fn execute_join(
                                                     if locked_err.is_none() {
                                                         *locked_err = Some(e);
                                                     }
+                                                    cancelled_ref.store(true, Ordering::Relaxed);
                                                     break;
                                                 }
                                             }
@@ -260,7 +261,7 @@ pub fn execute_join(
                                     for &loc in matched_locs {
                                         if let Some(f) = filter {
                                             match test_filter_pair(
-                                                f, l_batch, l_idx, &r_batches, loc, &comb_sch,
+                                                f, l_batch, l_idx, r_batches, loc, comb_sch,
                                             ) {
                                                 Ok(true) => {}
                                                 Ok(false) => continue,
@@ -269,6 +270,7 @@ pub fn execute_join(
                                                     if locked_err.is_none() {
                                                         *locked_err = Some(e);
                                                     }
+                                                    cancelled_ref.store(true, Ordering::Relaxed);
                                                     break;
                                                 }
                                             }
@@ -298,7 +300,7 @@ pub fn execute_join(
                                     if let Some(f) = filter {
                                         for &loc in matched_locs {
                                             match test_filter_pair(
-                                                f, l_batch, l_idx, &r_batches, loc, &comb_sch,
+                                                f, l_batch, l_idx, r_batches, loc, comb_sch,
                                             ) {
                                                 Ok(true) => {
                                                     matched = true;
@@ -310,6 +312,7 @@ pub fn execute_join(
                                                     if locked_err.is_none() {
                                                         *locked_err = Some(e);
                                                     }
+                                                    cancelled_ref.store(true, Ordering::Relaxed);
                                                     break;
                                                 }
                                             }
@@ -330,7 +333,7 @@ pub fn execute_join(
                                     if let Some(f) = filter {
                                         for &loc in matched_locs {
                                             match test_filter_pair(
-                                                f, l_batch, l_idx, &r_batches, loc, &comb_sch,
+                                                f, l_batch, l_idx, r_batches, loc, comb_sch,
                                             ) {
                                                 Ok(true) => {
                                                     has_matching_right = true;
@@ -342,6 +345,7 @@ pub fn execute_join(
                                                     if locked_err.is_none() {
                                                         *locked_err = Some(e);
                                                     }
+                                                    cancelled_ref.store(true, Ordering::Relaxed);
                                                     break;
                                                 }
                                             }
@@ -359,21 +363,18 @@ pub fn execute_join(
                         }
                     }
                 }
-                res.lock().unwrap()[morsel.id] = builder.finish();
+                *res_ref[morsel.id].lock().unwrap() = builder.finish();
             });
         }
     });
 
-    if let Some(err) = Arc::try_unwrap(error_cell).unwrap().into_inner().unwrap() {
+    if let Some(err) = error_cell.into_inner().unwrap() {
         return Err(err);
     }
 
-    let all_results: Vec<Batch> = Arc::try_unwrap(results)
-        .unwrap()
-        .into_inner()
-        .unwrap()
+    let all_results: Vec<Batch> = results
         .into_iter()
-        .flatten()
+        .flat_map(|m| m.into_inner().unwrap())
         .collect();
 
     Ok(all_results)
@@ -401,30 +402,28 @@ pub fn execute_cross_join(
 
     let num_morsels = morsels.len();
     let num_threads = threads.max(1);
-    let queue = Arc::new(Mutex::new(VecDeque::from(morsels)));
-    let results = Arc::new(Mutex::new(vec![Vec::new(); num_morsels]));
-    let r_batches = Arc::new(right_batches);
+    let next_morsel = AtomicUsize::new(0);
+    let results: Vec<Mutex<Vec<Batch>>> =
+        (0..num_morsels).map(|_| Mutex::new(Vec::new())).collect();
 
     std::thread::scope(|s| {
         for _ in 0..num_threads {
-            let q = Arc::clone(&queue);
-            let res = Arc::clone(&results);
-            let r_ref = Arc::clone(&r_batches);
-            let out_sch = Arc::clone(&out_schema);
+            let next_ref = &next_morsel;
+            let morsels_ref = &morsels;
+            let res_ref = &results;
+            let r_ref = &right_batches;
+            let out_sch = &out_schema;
             let l_cols_len = left_schema.fields.len();
             let r_cols_len = right_schema.fields.len();
 
             s.spawn(move || loop {
-                let morsel = {
-                    let mut locked_q = q.lock().unwrap();
-                    locked_q.pop_front()
-                };
-                let morsel = match morsel {
-                    Some(m) => m,
-                    None => break,
-                };
+                let idx = next_ref.fetch_add(1, Ordering::Relaxed);
+                if idx >= num_morsels {
+                    break;
+                }
+                let morsel = &morsels_ref[idx];
 
-                let mut builder = BatchBuilder::new(Arc::clone(&out_sch));
+                let mut builder = BatchBuilder::new(Arc::clone(out_sch));
                 for l_batch in &morsel.batches {
                     for l_idx in 0..l_batch.len {
                         for r_batch in r_ref.iter() {
@@ -440,17 +439,14 @@ pub fn execute_cross_join(
                         }
                     }
                 }
-                res.lock().unwrap()[morsel.id] = builder.finish();
+                *res_ref[morsel.id].lock().unwrap() = builder.finish();
             });
         }
     });
 
-    let merged: Vec<Batch> = Arc::try_unwrap(results)
-        .unwrap()
-        .into_inner()
-        .unwrap()
+    let merged: Vec<Batch> = results
         .into_iter()
-        .flatten()
+        .flat_map(|m| m.into_inner().unwrap())
         .collect();
 
     Ok(merged)

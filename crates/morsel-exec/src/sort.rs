@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, VecDeque};
+use std::collections::BinaryHeap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -130,37 +131,136 @@ pub fn execute_sort(
         cur_offset += m_rows;
     }
 
-    let morsel_queue = Arc::new(Mutex::new(VecDeque::from(
-        morsels.into_iter().zip(morsel_offsets).collect::<Vec<_>>(),
-    )));
-    let error_cell = Arc::new(Mutex::new(None));
+    let morsels_with_offsets: Vec<(Morsel, usize)> =
+        morsels.into_iter().zip(morsel_offsets).collect();
+    let num_morsels = morsels_with_offsets.len();
+    let next_morsel = AtomicUsize::new(0);
+    let cancelled = AtomicBool::new(false);
+    let error_cell = Mutex::new(None);
 
     if let Some(k) = limit {
         // Top-k execution
-        let thread_heaps: Arc<Mutex<Vec<Vec<SortRow>>>> = Arc::new(Mutex::new(Vec::new()));
+        let all_thread_heaps = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..num_threads)
+                .map(|_| {
+                    let next_ref = &next_morsel;
+                    let morsels_ref = &morsels_with_offsets;
+                    let err_cell = &error_cell;
+                    let cancelled_ref = &cancelled;
 
-        std::thread::scope(|s| {
-            for _ in 0..num_threads {
-                let q = Arc::clone(&morsel_queue);
-                let t_heaps = Arc::clone(&thread_heaps);
-                let err_cell = Arc::clone(&error_cell);
+                    s.spawn(move || {
+                        let mut max_heap: BinaryHeap<MaxHeapRow> = BinaryHeap::new();
+                        loop {
+                            if cancelled_ref.load(AtomicOrdering::Relaxed) {
+                                break;
+                            }
+                            let idx = next_ref.fetch_add(1, AtomicOrdering::Relaxed);
+                            if idx >= num_morsels {
+                                break;
+                            }
+                            let (morsel, m_start_row) = &morsels_ref[idx];
+
+                            let mut row_counter = *m_start_row;
+                            for batch in &morsel.batches {
+                                let key_cols = match keys
+                                    .iter()
+                                    .map(|k| eval(&k.expr, batch))
+                                    .collect::<Result<Vec<_>>>()
+                                {
+                                    Ok(cols) => cols,
+                                    Err(e) => {
+                                        let mut locked_err = err_cell.lock().unwrap();
+                                        if locked_err.is_none() {
+                                            *locked_err = Some(e);
+                                        }
+                                        cancelled_ref.store(true, AtomicOrdering::Relaxed);
+                                        break;
+                                    }
+                                };
+
+                                for i in 0..batch.len {
+                                    let row_keys: Vec<Scalar> =
+                                        key_cols.iter().map(|c| c.get(i)).collect();
+                                    let row_vals: Vec<Scalar> = (0..batch.columns.len())
+                                        .map(|c| batch.columns[c].get(i))
+                                        .collect();
+                                    let sort_row = SortRow {
+                                        keys: row_keys,
+                                        values: row_vals,
+                                        source_id: row_counter,
+                                    };
+                                    row_counter += 1;
+
+                                    if max_heap.len() < k {
+                                        max_heap.push(MaxHeapRow {
+                                            row: sort_row,
+                                            keys,
+                                        });
+                                    } else if cmp_sort_rows(
+                                        &sort_row,
+                                        &max_heap.peek().unwrap().row,
+                                        keys,
+                                    ) == Ordering::Less
+                                    {
+                                        max_heap.pop();
+                                        max_heap.push(MaxHeapRow {
+                                            row: sort_row,
+                                            keys,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+
+                        max_heap
+                            .into_iter()
+                            .map(|item| item.row)
+                            .collect::<Vec<SortRow>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        if let Some(err) = error_cell.into_inner().unwrap() {
+            return Err(err);
+        }
+
+        let mut all_top: Vec<SortRow> = all_thread_heaps.into_iter().flatten().collect();
+
+        all_top.sort_by(|a, b| cmp_sort_rows(a, b, keys));
+        all_top.truncate(k);
+
+        return rows_to_batches(&all_top, &schema);
+    }
+
+    // Full sort with k-way merge of sorted runs
+    let all_sorted_runs = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..num_threads)
+            .map(|_| {
+                let next_ref = &next_morsel;
+                let morsels_ref = &morsels_with_offsets;
+                let err_cell = &error_cell;
+                let cancelled_ref = &cancelled;
 
                 s.spawn(move || {
-                    let mut max_heap: BinaryHeap<MaxHeapRow> = BinaryHeap::new();
+                    let mut local_runs = Vec::new();
                     loop {
-                        if err_cell.lock().unwrap().is_some() {
+                        if cancelled_ref.load(AtomicOrdering::Relaxed) {
                             break;
                         }
-                        let item = {
-                            let mut locked = q.lock().unwrap();
-                            locked.pop_front()
-                        };
-                        let (morsel, m_start_row) = match item {
-                            Some(m) => m,
-                            None => break,
-                        };
+                        let idx = next_ref.fetch_add(1, AtomicOrdering::Relaxed);
+                        if idx >= num_morsels {
+                            break;
+                        }
+                        let (morsel, m_start_row) = &morsels_ref[idx];
 
-                        let mut row_counter = m_start_row;
+                        let mut morsel_rows = Vec::new();
+                        let mut row_counter = *m_start_row;
+
                         for batch in &morsel.batches {
                             let key_cols = match keys
                                 .iter()
@@ -173,6 +273,7 @@ pub fn execute_sort(
                                     if locked_err.is_none() {
                                         *locked_err = Some(e);
                                     }
+                                    cancelled_ref.store(true, AtomicOrdering::Relaxed);
                                     break;
                                 }
                             };
@@ -183,124 +284,33 @@ pub fn execute_sort(
                                 let row_vals: Vec<Scalar> = (0..batch.columns.len())
                                     .map(|c| batch.columns[c].get(i))
                                     .collect();
-                                let sort_row = SortRow {
+                                morsel_rows.push(SortRow {
                                     keys: row_keys,
                                     values: row_vals,
                                     source_id: row_counter,
-                                };
+                                });
                                 row_counter += 1;
-
-                                if max_heap.len() < k {
-                                    max_heap.push(MaxHeapRow {
-                                        row: sort_row,
-                                        keys,
-                                    });
-                                } else if cmp_sort_rows(
-                                    &sort_row,
-                                    &max_heap.peek().unwrap().row,
-                                    keys,
-                                ) == Ordering::Less
-                                {
-                                    max_heap.pop();
-                                    max_heap.push(MaxHeapRow {
-                                        row: sort_row,
-                                        keys,
-                                    });
-                                }
                             }
                         }
+
+                        morsel_rows.sort_by(|a, b| cmp_sort_rows(a, b, keys));
+                        local_runs.push(morsel_rows);
                     }
-
-                    let rows: Vec<SortRow> = max_heap.into_iter().map(|item| item.row).collect();
-                    t_heaps.lock().unwrap().push(rows);
-                });
-            }
-        });
-
-        if let Some(err) = Arc::try_unwrap(error_cell).unwrap().into_inner().unwrap() {
-            return Err(err);
-        }
-
-        let mut all_top: Vec<SortRow> = Arc::try_unwrap(thread_heaps)
-            .unwrap()
-            .into_inner()
-            .unwrap()
-            .into_iter()
-            .flatten()
+                    local_runs
+                })
+            })
             .collect();
-
-        all_top.sort_by(|a, b| cmp_sort_rows(a, b, keys));
-        all_top.truncate(k);
-
-        return rows_to_batches(&all_top, &schema);
-    }
-
-    // Full sort with k-way merge of sorted runs
-    let sorted_runs: Arc<Mutex<Vec<Vec<SortRow>>>> = Arc::new(Mutex::new(Vec::new()));
-
-    std::thread::scope(|s| {
-        for _ in 0..num_threads {
-            let q = Arc::clone(&morsel_queue);
-            let s_runs = Arc::clone(&sorted_runs);
-            let err_cell = Arc::clone(&error_cell);
-
-            s.spawn(move || loop {
-                if err_cell.lock().unwrap().is_some() {
-                    break;
-                }
-                let item: Option<(Morsel, usize)> = {
-                    let mut locked = q.lock().unwrap();
-                    locked.pop_front()
-                };
-                let (morsel, m_start_row) = match item {
-                    Some(m) => m,
-                    None => break,
-                };
-
-                let mut morsel_rows = Vec::new();
-                let mut row_counter = m_start_row;
-
-                for batch in &morsel.batches {
-                    let key_cols = match keys
-                        .iter()
-                        .map(|k| eval(&k.expr, batch))
-                        .collect::<Result<Vec<_>>>()
-                    {
-                        Ok(cols) => cols,
-                        Err(e) => {
-                            let mut locked_err = err_cell.lock().unwrap();
-                            if locked_err.is_none() {
-                                *locked_err = Some(e);
-                            }
-                            break;
-                        }
-                    };
-
-                    for i in 0..batch.len {
-                        let row_keys: Vec<Scalar> = key_cols.iter().map(|c| c.get(i)).collect();
-                        let row_vals: Vec<Scalar> = (0..batch.columns.len())
-                            .map(|c| batch.columns[c].get(i))
-                            .collect();
-                        morsel_rows.push(SortRow {
-                            keys: row_keys,
-                            values: row_vals,
-                            source_id: row_counter,
-                        });
-                        row_counter += 1;
-                    }
-                }
-
-                morsel_rows.sort_by(|a, b| cmp_sort_rows(a, b, keys));
-                s_runs.lock().unwrap().push(morsel_rows);
-            });
-        }
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect::<Vec<_>>()
     });
 
-    if let Some(err) = Arc::try_unwrap(error_cell).unwrap().into_inner().unwrap() {
+    if let Some(err) = error_cell.into_inner().unwrap() {
         return Err(err);
     }
 
-    let runs = Arc::try_unwrap(sorted_runs).unwrap().into_inner().unwrap();
+    let runs: Vec<Vec<SortRow>> = all_sorted_runs.into_iter().flatten().collect();
     if runs.is_empty() {
         return Ok(Vec::new());
     }

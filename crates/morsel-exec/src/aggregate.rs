@@ -1,4 +1,5 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ahash::AHashSet;
@@ -9,13 +10,11 @@ use morsel_plan::{AggExpr, AggFunc, Expr, LogicalPlan};
 use crate::catalog::Catalog;
 use crate::eval::eval;
 use crate::execute::execute;
-use crate::scheduler::{create_morsels, Morsel};
+use crate::scheduler::create_morsels;
 
 fn pow10(n: u8) -> i128 {
     10i128.pow(n as u32)
 }
-
-type AggMap = HashMap<Vec<ScalarKey>, Vec<AggState>>;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ScalarKey {
@@ -283,98 +282,106 @@ pub fn execute_aggregate(
     let morsels = create_morsels(&input_batches);
     let num_threads = threads.max(1);
 
-    let queue = Arc::new(Mutex::new(VecDeque::from(morsels)));
-    let thread_maps: Arc<Mutex<Vec<AggMap>>> = Arc::new(Mutex::new(Vec::new()));
-    let error_cell = Arc::new(Mutex::new(None));
+    let next_morsel = AtomicUsize::new(0);
+    let cancelled = AtomicBool::new(false);
+    let error_cell = Mutex::new(None);
 
-    std::thread::scope(|s| {
-        for _ in 0..num_threads {
-            let q = Arc::clone(&queue);
-            let t_maps = Arc::clone(&thread_maps);
-            let err_cell = Arc::clone(&error_cell);
-            let arg_types = &agg_arg_types;
+    let maps = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..num_threads)
+            .map(|_| {
+                let next_ref = &next_morsel;
+                let morsels_ref = &morsels;
+                let err_cell = &error_cell;
+                let cancelled_ref = &cancelled;
+                let arg_types = &agg_arg_types;
 
-            s.spawn(move || {
-                let mut local_map: HashMap<Vec<ScalarKey>, Vec<AggState>> = HashMap::new();
-                loop {
-                    if err_cell.lock().unwrap().is_some() {
-                        break;
-                    }
-                    let morsel: Option<Morsel> = {
-                        let mut locked_q = q.lock().unwrap();
-                        locked_q.pop_front()
-                    };
-                    let morsel = match morsel {
-                        Some(m) => m,
-                        None => break,
-                    };
+                s.spawn(move || {
+                    let mut local_map: HashMap<Vec<ScalarKey>, Vec<AggState>> = HashMap::new();
+                    loop {
+                        if cancelled_ref.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let idx = next_ref.fetch_add(1, Ordering::Relaxed);
+                        if idx >= morsels_ref.len() {
+                            break;
+                        }
+                        let morsel = &morsels_ref[idx];
 
-                    for batch in &morsel.batches {
-                        let group_cols: Vec<Column> = match group_by
-                            .iter()
-                            .map(|(e, _)| eval(e, batch))
-                            .collect::<Result<Vec<_>>>()
-                        {
-                            Ok(cols) => cols,
-                            Err(e) => {
-                                let mut locked_err = err_cell.lock().unwrap();
-                                if locked_err.is_none() {
-                                    *locked_err = Some(e);
-                                }
-                                break;
-                            }
-                        };
-
-                        let agg_cols: Vec<Option<Column>> = match aggs
-                            .iter()
-                            .map(|(agg, _)| agg.arg.as_ref().map(|e| eval(e, batch)).transpose())
-                            .collect::<Result<Vec<_>>>()
-                        {
-                            Ok(cols) => cols,
-                            Err(e) => {
-                                let mut locked_err = err_cell.lock().unwrap();
-                                if locked_err.is_none() {
-                                    *locked_err = Some(e);
-                                }
-                                break;
-                            }
-                        };
-
-                        for row_idx in 0..batch.len {
-                            let key: Vec<ScalarKey> =
-                                group_cols.iter().map(|c| to_key(&c.get(row_idx))).collect();
-
-                            let states = local_map.entry(key).or_insert_with(|| {
-                                aggs.iter()
-                                    .enumerate()
-                                    .map(|(idx, (agg, _))| AggState::new(agg.func, arg_types[idx]))
-                                    .collect()
-                            });
-
-                            for (agg_idx, (agg, _)) in aggs.iter().enumerate() {
-                                let val = agg_cols[agg_idx].as_ref().map(|c| c.get(row_idx));
-                                if let Err(e) = states[agg_idx].update(agg.func, val) {
+                        for batch in &morsel.batches {
+                            let group_cols: Vec<Column> = match group_by
+                                .iter()
+                                .map(|(e, _)| eval(e, batch))
+                                .collect::<Result<Vec<_>>>()
+                            {
+                                Ok(cols) => cols,
+                                Err(e) => {
                                     let mut locked_err = err_cell.lock().unwrap();
                                     if locked_err.is_none() {
                                         *locked_err = Some(e);
                                     }
+                                    cancelled_ref.store(true, Ordering::Relaxed);
                                     break;
+                                }
+                            };
+
+                            let agg_cols: Vec<Option<Column>> = match aggs
+                                .iter()
+                                .map(|(agg, _)| {
+                                    agg.arg.as_ref().map(|e| eval(e, batch)).transpose()
+                                })
+                                .collect::<Result<Vec<_>>>()
+                            {
+                                Ok(cols) => cols,
+                                Err(e) => {
+                                    let mut locked_err = err_cell.lock().unwrap();
+                                    if locked_err.is_none() {
+                                        *locked_err = Some(e);
+                                    }
+                                    cancelled_ref.store(true, Ordering::Relaxed);
+                                    break;
+                                }
+                            };
+
+                            for row_idx in 0..batch.len {
+                                let key: Vec<ScalarKey> =
+                                    group_cols.iter().map(|c| to_key(&c.get(row_idx))).collect();
+
+                                let states = local_map.entry(key).or_insert_with(|| {
+                                    aggs.iter()
+                                        .enumerate()
+                                        .map(|(idx, (agg, _))| {
+                                            AggState::new(agg.func, arg_types[idx])
+                                        })
+                                        .collect()
+                                });
+
+                                for (agg_idx, (agg, _)) in aggs.iter().enumerate() {
+                                    let val = agg_cols[agg_idx].as_ref().map(|c| c.get(row_idx));
+                                    if let Err(e) = states[agg_idx].update(agg.func, val) {
+                                        let mut locked_err = err_cell.lock().unwrap();
+                                        if locked_err.is_none() {
+                                            *locked_err = Some(e);
+                                        }
+                                        cancelled_ref.store(true, Ordering::Relaxed);
+                                        break;
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                t_maps.lock().unwrap().push(local_map);
-            });
-        }
+                    local_map
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect::<Vec<_>>()
     });
 
-    if let Some(err) = Arc::try_unwrap(error_cell).unwrap().into_inner().unwrap() {
+    if let Some(err) = error_cell.into_inner().unwrap() {
         return Err(err);
     }
-
-    // Merge maps across threads
-    let maps = Arc::try_unwrap(thread_maps).unwrap().into_inner().unwrap();
     let mut merged_map: HashMap<Vec<ScalarKey>, Vec<AggState>> = HashMap::new();
 
     for map in maps {
