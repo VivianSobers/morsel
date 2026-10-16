@@ -1,0 +1,23 @@
+[package]
+name = "morsel-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "morsel"
+path = "src/main.rs"
+
+[dependencies]
+morsel-core = { path = "../morsel-core" }
+morsel-plan = { path = "../morsel-plan" }
+morsel-exec = { path = "../morsel-exec" }
+morsel-sql = { path = "../morsel-sql" }
+anyhow = "1.0"
+chrono = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+arrow = { version = "60.0.0" }
+parquet = { version = "60.0.0", features = ["arrow"] }
+tempfile = "3"
