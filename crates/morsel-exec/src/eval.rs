@@ -525,19 +525,102 @@ fn eval_comparison(op: BinOp, left: &Column, right: &Column, len: usize) -> Resu
             validity.push(false);
             data.push(false);
         } else {
-            validity.push(true);
-            let cmp = compare_scalars(&left.get(i), &right.get(i))?;
-            let res = match op {
-                BinOp::Eq => cmp == std::cmp::Ordering::Equal,
-                BinOp::NotEq => cmp != std::cmp::Ordering::Equal,
-                BinOp::Lt => cmp == std::cmp::Ordering::Less,
-                BinOp::LtEq => cmp == std::cmp::Ordering::Less || cmp == std::cmp::Ordering::Equal,
-                BinOp::Gt => cmp == std::cmp::Ordering::Greater,
-                BinOp::GtEq => {
-                    cmp == std::cmp::Ordering::Greater || cmp == std::cmp::Ordering::Equal
+            let s_left = left.get(i);
+            let s_right = right.get(i);
+            let res = match (&s_left, &s_right) {
+                (Scalar::Float64(x), Scalar::Float64(y)) => {
+                    if x.is_nan() || y.is_nan() {
+                        op == BinOp::NotEq
+                    } else {
+                        let cmp = x.total_cmp(y);
+                        match op {
+                            BinOp::Eq => cmp == std::cmp::Ordering::Equal,
+                            BinOp::NotEq => cmp != std::cmp::Ordering::Equal,
+                            BinOp::Lt => cmp == std::cmp::Ordering::Less,
+                            BinOp::LtEq => {
+                                cmp == std::cmp::Ordering::Less || cmp == std::cmp::Ordering::Equal
+                            }
+                            BinOp::Gt => cmp == std::cmp::Ordering::Greater,
+                            BinOp::GtEq => {
+                                cmp == std::cmp::Ordering::Greater
+                                    || cmp == std::cmp::Ordering::Equal
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
                 }
-                _ => unreachable!(),
+                (Scalar::Float64(x), other)
+                    if matches!(
+                        other,
+                        Scalar::Int32(_) | Scalar::Int64(_) | Scalar::Decimal(_, _)
+                    ) =>
+                {
+                    let y = scalar_to_f64(other)?;
+                    if x.is_nan() || y.is_nan() {
+                        op == BinOp::NotEq
+                    } else {
+                        let cmp = x.total_cmp(&y);
+                        match op {
+                            BinOp::Eq => cmp == std::cmp::Ordering::Equal,
+                            BinOp::NotEq => cmp != std::cmp::Ordering::Equal,
+                            BinOp::Lt => cmp == std::cmp::Ordering::Less,
+                            BinOp::LtEq => {
+                                cmp == std::cmp::Ordering::Less || cmp == std::cmp::Ordering::Equal
+                            }
+                            BinOp::Gt => cmp == std::cmp::Ordering::Greater,
+                            BinOp::GtEq => {
+                                cmp == std::cmp::Ordering::Greater
+                                    || cmp == std::cmp::Ordering::Equal
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+                (other, Scalar::Float64(y))
+                    if matches!(
+                        other,
+                        Scalar::Int32(_) | Scalar::Int64(_) | Scalar::Decimal(_, _)
+                    ) =>
+                {
+                    let x = scalar_to_f64(other)?;
+                    if x.is_nan() || y.is_nan() {
+                        op == BinOp::NotEq
+                    } else {
+                        let cmp = x.total_cmp(y);
+                        match op {
+                            BinOp::Eq => cmp == std::cmp::Ordering::Equal,
+                            BinOp::NotEq => cmp != std::cmp::Ordering::Equal,
+                            BinOp::Lt => cmp == std::cmp::Ordering::Less,
+                            BinOp::LtEq => {
+                                cmp == std::cmp::Ordering::Less || cmp == std::cmp::Ordering::Equal
+                            }
+                            BinOp::Gt => cmp == std::cmp::Ordering::Greater,
+                            BinOp::GtEq => {
+                                cmp == std::cmp::Ordering::Greater
+                                    || cmp == std::cmp::Ordering::Equal
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+                _ => {
+                    let cmp = compare_scalars(&s_left, &s_right)?;
+                    match op {
+                        BinOp::Eq => cmp == std::cmp::Ordering::Equal,
+                        BinOp::NotEq => cmp != std::cmp::Ordering::Equal,
+                        BinOp::Lt => cmp == std::cmp::Ordering::Less,
+                        BinOp::LtEq => {
+                            cmp == std::cmp::Ordering::Less || cmp == std::cmp::Ordering::Equal
+                        }
+                        BinOp::Gt => cmp == std::cmp::Ordering::Greater,
+                        BinOp::GtEq => {
+                            cmp == std::cmp::Ordering::Greater || cmp == std::cmp::Ordering::Equal
+                        }
+                        _ => unreachable!(),
+                    }
+                }
             };
+            validity.push(true);
             data.push(res);
         }
     }
@@ -611,9 +694,7 @@ pub fn compare_scalars(a: &Scalar, b: &Scalar) -> Result<std::cmp::Ordering> {
         (Scalar::Int64(x), Scalar::Int64(y)) => Ok(x.cmp(y)),
         (Scalar::Int32(x), Scalar::Int64(y)) => Ok((*x as i64).cmp(y)),
         (Scalar::Int64(x), Scalar::Int32(y)) => Ok(x.cmp(&(*y as i64))),
-        (Scalar::Float64(x), Scalar::Float64(y)) => {
-            Ok(x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal))
-        }
+        (Scalar::Float64(x), Scalar::Float64(y)) => Ok(x.total_cmp(y)),
         (Scalar::Date32(x), Scalar::Date32(y)) => Ok(x.cmp(y)),
         (Scalar::Utf8(x), Scalar::Utf8(y)) => Ok(x.cmp(y)),
         (Scalar::Bool(x), Scalar::Bool(y)) => Ok(x.cmp(y)),
@@ -622,6 +703,24 @@ pub fn compare_scalars(a: &Scalar, b: &Scalar) -> Result<std::cmp::Ordering> {
         (Scalar::Int32(x), Scalar::Decimal(v, s)) => compare_decimals(*x as i128, 0, *v, *s),
         (Scalar::Decimal(v, s), Scalar::Int64(x)) => compare_decimals(*v, *s, *x as i128, 0),
         (Scalar::Int64(x), Scalar::Decimal(v, s)) => compare_decimals(*x as i128, 0, *v, *s),
+        (Scalar::Float64(x), other)
+            if matches!(
+                other,
+                Scalar::Int32(_) | Scalar::Int64(_) | Scalar::Decimal(_, _)
+            ) =>
+        {
+            let y = scalar_to_f64(other)?;
+            Ok(x.total_cmp(&y))
+        }
+        (other, Scalar::Float64(y))
+            if matches!(
+                other,
+                Scalar::Int32(_) | Scalar::Int64(_) | Scalar::Decimal(_, _)
+            ) =>
+        {
+            let x = scalar_to_f64(other)?;
+            Ok(x.total_cmp(y))
+        }
         _ => bail!("cannot compare {:?} and {:?}", a, b),
     }
 }

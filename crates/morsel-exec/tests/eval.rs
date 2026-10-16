@@ -913,3 +913,72 @@ fn div_by_zero_returns_null() {
     assert!(res.is_null(0));
     assert!(res.is_null(1));
 }
+
+#[test]
+fn nan_comparison_is_false() {
+    let schema = Arc::new(Schema {
+        fields: vec![
+            Field {
+                name: "a".to_string(),
+                dtype: DataType::Float64,
+                nullable: false,
+            },
+            Field {
+                name: "b".to_string(),
+                dtype: DataType::Float64,
+                nullable: false,
+            },
+        ],
+    });
+    let batch = Batch::new(
+        schema,
+        vec![
+            Arc::new(Column::from_scalars(
+                DataType::Float64,
+                &[Scalar::Float64(f64::NAN), Scalar::Float64(f64::NAN)],
+            )),
+            Arc::new(Column::from_scalars(
+                DataType::Float64,
+                &[Scalar::Float64(5.0), Scalar::Float64(f64::NAN)],
+            )),
+        ],
+    );
+
+    let eq_expr = Expr::Binary {
+        op: BinOp::Eq,
+        left: Box::new(Expr::Column(0)),
+        right: Box::new(Expr::Column(1)),
+    };
+    let res = eval(&eq_expr, &batch).unwrap();
+    assert_eq!(res.get(0), Scalar::Bool(false));
+    assert_eq!(res.get(1), Scalar::Bool(false));
+
+    let neq_expr = Expr::Binary {
+        op: BinOp::NotEq,
+        left: Box::new(Expr::Column(0)),
+        right: Box::new(Expr::Column(1)),
+    };
+    let res = eval(&neq_expr, &batch).unwrap();
+    assert_eq!(res.get(0), Scalar::Bool(true));
+    assert_eq!(res.get(1), Scalar::Bool(true));
+
+    let lt_expr = Expr::Binary {
+        op: BinOp::Lt,
+        left: Box::new(Expr::Column(0)),
+        right: Box::new(Expr::Column(1)),
+    };
+    let res = eval(&lt_expr, &batch).unwrap();
+    assert_eq!(res.get(0), Scalar::Bool(false));
+}
+
+#[test]
+fn float64_cross_type_comparisons() {
+    let f = Scalar::Float64(4.9);
+    let dec = Scalar::Decimal(4064928, 2);
+    let int = Scalar::Int32(5);
+
+    assert_eq!(compare_scalars(&f, &dec).unwrap(), std::cmp::Ordering::Less);
+    assert_eq!(compare_scalars(&dec, &f).unwrap(), std::cmp::Ordering::Greater);
+    assert_eq!(compare_scalars(&f, &int).unwrap(), std::cmp::Ordering::Less);
+    assert_eq!(compare_scalars(&int, &f).unwrap(), std::cmp::Ordering::Greater);
+}
