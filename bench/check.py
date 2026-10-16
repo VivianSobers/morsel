@@ -38,7 +38,7 @@ def parse_query_number(q_str: str) -> int:
     return int(s)
 
 
-def cell_equal(actual: str, expected: str) -> bool:
+def cell_equal(actual: str, expected: str, is_order_key: bool = False) -> bool:
     if actual is None and expected is None:
         return True
     if actual is None or expected is None:
@@ -65,7 +65,8 @@ def cell_equal(actual: str, expected: str) -> bool:
         b_val = float(expected_s)
         if math.isnan(a_val) and math.isnan(b_val):
             return True
-        tol = max(0.01, 1e-9 * abs(b_val))
+        atol = 1e-12 if is_order_key else 0.01
+        tol = max(atol, 1e-9 * abs(b_val))
         return abs(a_val - b_val) <= tol
     except ValueError:
         pass
@@ -73,11 +74,16 @@ def cell_equal(actual: str, expected: str) -> bool:
     return actual_s == expected_s
 
 
-def rows_equal(actual_row: List[str], expected_row: List[str]) -> Tuple[bool, Optional[int]]:
+def rows_equal(
+    actual_row: List[str],
+    expected_row: List[str],
+    order_key_count: int = 0,
+) -> Tuple[bool, Optional[int]]:
     if len(actual_row) != len(expected_row):
         return False, min(len(actual_row), len(expected_row))
     for c, (a_cell, e_cell) in enumerate(zip(actual_row, expected_row)):
-        if not cell_equal(a_cell, e_cell):
+        is_order_key = c < order_key_count
+        if not cell_equal(a_cell, e_cell, is_order_key=is_order_key):
             return False, c
     return True, None
 
@@ -128,6 +134,7 @@ def compare(
                     if not cell_equal(
                         expected_rows[end_candidate][col_idx],
                         expected_rows[start][col_idx],
+                        is_order_key=True,
                     ):
                         same_keys = False
                         break
@@ -144,14 +151,18 @@ def compare(
         for r_offset, act_row in enumerate(act_block):
             row_idx = start + r_offset
             for col_idx in range(k):
-                if not cell_equal(act_row[col_idx], exp_block[0][col_idx]):
+                if not cell_equal(
+                    act_row[col_idx],
+                    exp_block[0][col_idx],
+                    is_order_key=True,
+                ):
                     return [
                         f"Row {row_idx}, column {col_idx}: order mismatch (expected key '{exp_block[0][col_idx]}', got '{act_row[col_idx]}')"
                     ]
 
         # If block size == 1, exact row match
         if len(exp_block) == 1:
-            eq, diff_col = rows_equal(act_block[0], exp_block[0])
+            eq, diff_col = rows_equal(act_block[0], exp_block[0], order_key_count=k)
             if not eq:
                 return [
                     f"Row {start}, column {diff_col}: expected '{exp_block[0][diff_col]}', got '{act_block[0][diff_col]}'"
@@ -162,7 +173,7 @@ def compare(
             for exp_idx, exp_row in enumerate(exp_block):
                 found = False
                 for a_i, act_idx in enumerate(unmatched_act):
-                    eq, _ = rows_equal(act_block[act_idx], exp_row)
+                    eq, _ = rows_equal(act_block[act_idx], exp_row, order_key_count=k)
                     if eq:
                         unmatched_act.pop(a_i)
                         found = True
@@ -170,7 +181,7 @@ def compare(
                 if not found:
                     # Report first differing column against first remaining unmatched actual row
                     first_unmatched = unmatched_act[0] if unmatched_act else 0
-                    _, diff_col = rows_equal(act_block[first_unmatched], exp_row)
+                    _, diff_col = rows_equal(act_block[first_unmatched], exp_row, order_key_count=k)
                     return [
                         f"Row {start + first_unmatched}, column {diff_col}: tie group mismatch (expected row matching '{exp_row}')"
                     ]

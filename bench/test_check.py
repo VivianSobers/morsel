@@ -50,6 +50,19 @@ class TestCheck(unittest.TestCase):
         diffs = compare(actual, expected, order_key_count=0)
         self.assertTrue(len(diffs) > 0)
 
+    def test_adjacent_float_sort_keys_with_last_bit_diff(self):
+        expected = [["9069.54", "val1"], ["9069.55", "val2"]]
+        actual = [["9069.54", "val1"], ["9069.550000000001", "val2"]]
+        diffs = compare(actual, expected, order_key_count=1)
+        self.assertEqual(diffs, [])
+
+    def test_adjacent_float_sort_keys_swapped_fails(self):
+        expected = [["9069.54", "val1"], ["9069.55", "val2"]]
+        actual = [["9069.55", "val2"], ["9069.54", "val1"]]
+        diffs = compare(actual, expected, order_key_count=1)
+        self.assertTrue(len(diffs) > 0)
+
+
 
 if __name__ == "__main__":
     unittest.main()
