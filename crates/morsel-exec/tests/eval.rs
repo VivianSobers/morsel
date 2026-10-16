@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use morsel_core::{Batch, Column, DataType, Field, Scalar, Schema};
-use morsel_exec::eval::{eval, eval_predicate};
+use morsel_exec::eval::{compare_scalars, eval, eval_predicate};
 use morsel_plan::{BinOp, DateField, Expr};
 
 #[test]
@@ -689,4 +689,12 @@ fn decimal_mul_overflow_returns_error() {
 
     let res = eval(&expr, &batch);
     assert!(res.is_err());
+}
+
+#[test]
+fn decimal_comparison_rescaling_overflow() {
+    let a = Scalar::Decimal(10i128.pow(30), 2);
+    let b = Scalar::Decimal(5, 18);
+    let ord = compare_scalars(&a, &b).unwrap();
+    assert_eq!(ord, std::cmp::Ordering::Greater);
 }

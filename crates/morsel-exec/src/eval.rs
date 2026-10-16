@@ -510,6 +510,62 @@ fn eval_comparison(op: BinOp, left: &Column, right: &Column, len: usize) -> Resu
     })
 }
 
+pub fn compare_decimals(v1: i128, s1: u8, v2: i128, s2: u8) -> Result<std::cmp::Ordering> {
+    if s1 == s2 {
+        return Ok(v1.cmp(&v2));
+    }
+    let target_s = s1.max(s2);
+    if let (Ok(p1), Ok(p2)) = (checked_pow10(target_s - s1), checked_pow10(target_s - s2)) {
+        if let (Some(r1), Some(r2)) = (v1.checked_mul(p1), v2.checked_mul(p2)) {
+            return Ok(r1.cmp(&r2));
+        }
+    }
+    match (v1.cmp(&0), v2.cmp(&0)) {
+        (std::cmp::Ordering::Less, std::cmp::Ordering::Greater | std::cmp::Ordering::Equal) => {
+            return Ok(std::cmp::Ordering::Less);
+        }
+        (std::cmp::Ordering::Greater | std::cmp::Ordering::Equal, std::cmp::Ordering::Less) => {
+            return Ok(std::cmp::Ordering::Greater);
+        }
+        (std::cmp::Ordering::Equal, std::cmp::Ordering::Equal) => {
+            return Ok(std::cmp::Ordering::Equal);
+        }
+        _ => {}
+    }
+    let negative = v1 < 0;
+    let (u1, u2) = (v1.abs(), v2.abs());
+
+    let (w1, f1, f1_scale) = if s1 <= 38 {
+        let p = checked_pow10(s1)?;
+        (u1 / p, u1 % p, s1)
+    } else {
+        (0, u1, s1)
+    };
+    let (w2, f2, f2_scale) = if s2 <= 38 {
+        let p = checked_pow10(s2)?;
+        (u2 / p, u2 % p, s2)
+    } else {
+        (0, u2, s2)
+    };
+
+    let ord = if w1 != w2 {
+        w1.cmp(&w2)
+    } else {
+        let target_frac_s = f1_scale.max(f2_scale);
+        let p1 = checked_pow10(target_frac_s - f1_scale)?;
+        let p2 = checked_pow10(target_frac_s - f2_scale)?;
+        let rf1 = f1
+            .checked_mul(p1)
+            .ok_or_else(|| anyhow::anyhow!("decimal comparison overflow"))?;
+        let rf2 = f2
+            .checked_mul(p2)
+            .ok_or_else(|| anyhow::anyhow!("decimal comparison overflow"))?;
+        rf1.cmp(&rf2)
+    };
+
+    Ok(if negative { ord.reverse() } else { ord })
+}
+
 pub fn compare_scalars(a: &Scalar, b: &Scalar) -> Result<std::cmp::Ordering> {
     match (a, b) {
         (Scalar::Int32(x), Scalar::Int32(y)) => Ok(x.cmp(y)),
@@ -522,12 +578,7 @@ pub fn compare_scalars(a: &Scalar, b: &Scalar) -> Result<std::cmp::Ordering> {
         (Scalar::Date32(x), Scalar::Date32(y)) => Ok(x.cmp(y)),
         (Scalar::Utf8(x), Scalar::Utf8(y)) => Ok(x.cmp(y)),
         (Scalar::Bool(x), Scalar::Bool(y)) => Ok(x.cmp(y)),
-        (Scalar::Decimal(v1, s1), Scalar::Decimal(v2, s2)) => {
-            let target_s = (*s1).max(*s2);
-            let r1 = v1 * pow10(target_s - s1);
-            let r2 = v2 * pow10(target_s - s2);
-            Ok(r1.cmp(&r2))
-        }
+        (Scalar::Decimal(v1, s1), Scalar::Decimal(v2, s2)) => compare_decimals(*v1, *s1, *v2, *s2),
         _ => bail!("cannot compare {:?} and {:?}", a, b),
     }
 }
