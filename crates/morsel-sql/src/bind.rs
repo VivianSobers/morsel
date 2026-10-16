@@ -36,7 +36,7 @@ pub fn plan_sql(sql_str: &str, schemas: &dyn SchemaProvider) -> Result<LogicalPl
     }
 }
 
-fn bind_query(
+pub(crate) fn bind_query(
     query: &sql::Query,
     schemas: &dyn SchemaProvider,
     ctes: &HashMap<String, sql::Query>,
@@ -50,16 +50,16 @@ fn bind_query(
     bind_select(body, query, schemas, ctes)
 }
 
-struct TableScope {
-    alias: String,
-    table_name: Option<String>,
-    full_schema: Schema,
-    used_columns: HashSet<usize>,
-    derived_plan: Option<LogicalPlan>,
+pub(crate) struct TableScope {
+    pub(crate) alias: String,
+    pub(crate) table_name: Option<String>,
+    pub(crate) full_schema: Schema,
+    pub(crate) used_columns: HashSet<usize>,
+    pub(crate) derived_plan: Option<LogicalPlan>,
 }
 
-struct QueryScope {
-    tables: Vec<TableScope>,
+pub(crate) struct QueryScope {
+    pub(crate) tables: Vec<TableScope>,
 }
 
 impl QueryScope {
@@ -223,6 +223,67 @@ fn collect_used_columns_from_expr(
         }
         sql::Expr::Nested(inner) => {
             collect_used_columns_from_expr(inner, scope, select_aliases)?;
+        }
+        sql::Expr::Exists { subquery, .. } => {
+            collect_outer_columns_from_query(subquery, scope)?;
+        }
+        sql::Expr::InSubquery { expr, subquery, .. } => {
+            collect_used_columns_from_expr(expr, scope, select_aliases)?;
+            collect_outer_columns_from_query(subquery, scope)?;
+        }
+        sql::Expr::Subquery(subquery) => {
+            collect_outer_columns_from_query(subquery, scope)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn collect_outer_columns_from_query(query: &sql::Query, scope: &mut QueryScope) -> Result<()> {
+    let inner_tables = crate::subquery::get_subquery_tables(query);
+    if let sql::SetExpr::Select(select) = &*query.body {
+        if let Some(selection) = &select.selection {
+            collect_outer_from_expr(selection, &inner_tables, scope)?;
+        }
+    }
+    Ok(())
+}
+
+fn collect_outer_from_expr(
+    expr: &sql::Expr,
+    inner_tables: &HashSet<String>,
+    scope: &mut QueryScope,
+) -> Result<()> {
+    match expr {
+        sql::Expr::CompoundIdentifier(parts) => {
+            if parts.len() == 2 {
+                let tbl = parts[0].value.to_lowercase();
+                if !inner_tables.contains(&tbl) {
+                    scope
+                        .mark_column_used(Some(&parts[0].value), &parts[1].value)
+                        .ok();
+                }
+            }
+        }
+        sql::Expr::Identifier(ident) => {
+            let col = &ident.value;
+            let found_in_outer = scope
+                .tables
+                .iter()
+                .any(|t| t.full_schema.index_of(col).is_some());
+            if found_in_outer {
+                scope.mark_column_used(None, col).ok();
+            }
+        }
+        sql::Expr::BinaryOp { left, right, .. } => {
+            collect_outer_from_expr(left, inner_tables, scope)?;
+            collect_outer_from_expr(right, inner_tables, scope)?;
+        }
+        sql::Expr::UnaryOp { expr, .. } => {
+            collect_outer_from_expr(expr, inner_tables, scope)?;
+        }
+        sql::Expr::Nested(inner) => {
+            collect_outer_from_expr(inner, inner_tables, scope)?;
         }
         _ => {}
     }
@@ -414,11 +475,23 @@ fn bind_select(
     };
 
     if let Some(selection) = &select.selection {
-        let predicate = binder_ctx.bind_expr(selection)?;
-        plan = LogicalPlan::Filter {
-            input: Box::new(plan),
-            predicate,
-        };
+        let (new_plan, final_pred) = crate::subquery::decorrelate_where(
+            selection,
+            plan,
+            &scope,
+            &table_offsets,
+            &col_maps,
+            &from_schema,
+            schemas,
+            ctes,
+        )?;
+        plan = new_plan;
+        if let Some(predicate) = final_pred {
+            plan = LogicalPlan::Filter {
+                input: Box::new(plan),
+                predicate,
+            };
+        }
     }
 
     let mut group_exprs = Vec::new();
@@ -919,15 +992,15 @@ fn bind_table_factor(
     Ok(())
 }
 
-struct ExprBinderContext<'a> {
-    scope: &'a QueryScope,
-    table_offsets: &'a [usize],
-    col_maps: &'a [HashMap<usize, usize>],
-    from_schema: &'a Schema,
+pub(crate) struct ExprBinderContext<'a> {
+    pub(crate) scope: &'a QueryScope,
+    pub(crate) table_offsets: &'a [usize],
+    pub(crate) col_maps: &'a [HashMap<usize, usize>],
+    pub(crate) from_schema: &'a Schema,
 }
 
 impl<'a> ExprBinderContext<'a> {
-    fn bind_expr(&self, expr: &sql::Expr) -> Result<Expr> {
+    pub(crate) fn bind_expr(&self, expr: &sql::Expr) -> Result<Expr> {
         if let Some(folded_date) = try_fold_date_expr(expr)? {
             return Ok(Expr::Literal(folded_date));
         }
@@ -1179,7 +1252,7 @@ impl<'a> ExprBinderContext<'a> {
     }
 }
 
-fn coerce_for_cmp(left: Expr, right: Expr, schema: &Schema) -> Result<(Expr, Expr)> {
+pub(crate) fn coerce_for_cmp(left: Expr, right: Expr, schema: &Schema) -> Result<(Expr, Expr)> {
     let lt = left.data_type(schema).ok();
     let rt = right.data_type(schema).ok();
 
@@ -1205,7 +1278,7 @@ fn coerce_for_cmp(left: Expr, right: Expr, schema: &Schema) -> Result<(Expr, Exp
     Ok((left, right))
 }
 
-fn map_bin_op(op: &sql::BinaryOperator) -> Result<BinOp> {
+pub(crate) fn map_bin_op(op: &sql::BinaryOperator) -> Result<BinOp> {
     match op {
         sql::BinaryOperator::Plus => Ok(BinOp::Add),
         sql::BinaryOperator::Minus => Ok(BinOp::Sub),
