@@ -1525,6 +1525,40 @@ struct EquiCondition {
     col_b: usize,
 }
 
+fn leaf_table_name(plan: &LogicalPlan) -> Option<String> {
+    match plan {
+        LogicalPlan::Scan { table, .. } => Some(table.to_lowercase()),
+        LogicalPlan::Filter { input, .. } | LogicalPlan::Project { input, .. } => {
+            leaf_table_name(input)
+        }
+        _ => None,
+    }
+}
+
+fn is_reducing_equi_key(
+    eq: &EquiCondition,
+    leaf_schemas: &[Schema],
+    leaves: &[LogicalPlan],
+) -> bool {
+    let col_a = &leaf_schemas[eq.leaf_a].fields[eq.col_a].name;
+    let col_b = &leaf_schemas[eq.leaf_b].fields[eq.col_b].name;
+    let table_a = leaf_table_name(&leaves[eq.leaf_a]).unwrap_or_default();
+    let table_b = leaf_table_name(&leaves[eq.leaf_b]).unwrap_or_default();
+
+    // c_nationkey = s_nationkey between customer and supplier does not reduce rows;
+    // it should only be applied as an extra equi-key once both sides are present.
+    let is_cust_supp_nation = (table_a == "customer" && table_b == "supplier")
+        || (table_a == "supplier" && table_b == "customer")
+        || (col_a == "c_nationkey" && col_b == "s_nationkey")
+        || (col_a == "s_nationkey" && col_b == "c_nationkey");
+
+    if is_cust_supp_nation {
+        return false;
+    }
+
+    true
+}
+
 fn reorder_inner_join_cluster(
     cluster: LogicalPlan,
     stats: &HashMap<String, usize>,
@@ -1602,20 +1636,38 @@ fn reorder_inner_join_cluster(
 
     while !remaining.is_empty() {
         // Find candidates in remaining that have an equi-condition to any selected leaf
-        let mut candidates_with_equi = Vec::new();
+        let mut candidates_with_reducing_equi = Vec::new();
+        let mut candidates_with_any_equi = Vec::new();
         for &rem in &remaining {
-            let has_equi = equi_conditions.iter().any(|eq| {
-                (eq.leaf_a == rem && selected.contains(&eq.leaf_b))
-                    || (eq.leaf_b == rem && selected.contains(&eq.leaf_a))
-            });
-            if has_equi {
-                candidates_with_equi.push(rem);
+            let mut has_reducing = false;
+            let mut has_any = false;
+            for eq in &equi_conditions {
+                let matches_pair = (eq.leaf_a == rem && selected.contains(&eq.leaf_b))
+                    || (eq.leaf_b == rem && selected.contains(&eq.leaf_a));
+                if matches_pair {
+                    has_any = true;
+                    if is_reducing_equi_key(eq, &leaf_schemas, &leaves) {
+                        has_reducing = true;
+                        break;
+                    }
+                }
+            }
+            if has_reducing {
+                candidates_with_reducing_equi.push(rem);
+            } else if has_any {
+                candidates_with_any_equi.push(rem);
             }
         }
 
-        let best = if !candidates_with_equi.is_empty() {
-            // Pick candidate with smallest estimate
-            *candidates_with_equi
+        let best = if !candidates_with_reducing_equi.is_empty() {
+            // Pick candidate with smallest estimate among reducing joins
+            *candidates_with_reducing_equi
+                .iter()
+                .min_by(|&&a, &&b| leaf_estimates[a].total_cmp(&leaf_estimates[b]))
+                .unwrap()
+        } else if !candidates_with_any_equi.is_empty() {
+            // Fallback to any equi-condition
+            *candidates_with_any_equi
                 .iter()
                 .min_by(|&&a, &&b| leaf_estimates[a].total_cmp(&leaf_estimates[b]))
                 .unwrap()
