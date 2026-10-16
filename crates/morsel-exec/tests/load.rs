@@ -178,3 +178,86 @@ fn negative_scale_decimal_errors() {
         res
     );
 }
+
+#[test]
+#[ignore]
+fn measure_sf10_load() {
+    let dir = std::path::Path::new("/dev/shm/morsel/tpch/sf10");
+    if !dir.exists() {
+        return;
+    }
+    let tables = [
+        "region", "nation", "supplier", "customer", "part", "partsupp", "orders", "lineitem",
+    ];
+
+    println!("--- SF10 Per-Table Load Times (Baseline) ---");
+    let mut total_per_table = 0.0;
+    for t in &tables {
+        let path = dir.join(format!("{}.parquet", t));
+        let t0 = std::time::Instant::now();
+        let (_name, table) = morsel_exec::parquet_load::load_parquet_file(&path).unwrap();
+        let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
+        total_per_table += elapsed;
+        println!("  {}: {:.2} ms (rows: {})", t, elapsed, table.rows);
+    }
+    println!("Sum of per-table times: {:.2} ms", total_per_table);
+
+    let t0 = std::time::Instant::now();
+    let cat = load_parquet_dir(dir, 16).unwrap();
+    let dir_elapsed = t0.elapsed().as_secs_f64() * 1000.0;
+    println!(
+        "load_parquet_dir(16 threads): {:.2} ms (tables: {})",
+        dir_elapsed,
+        cat.tables.len()
+    );
+}
+
+#[test]
+fn test_sf1_loaded_columns_equal_old_path() {
+    let dir = std::path::Path::new("/dev/shm/morsel/tpch/sf1");
+    if !dir.exists() {
+        return;
+    }
+    let cat_new = morsel_exec::catalog::load_parquet_dir(dir, 16).unwrap();
+    let cat_old = morsel_exec::catalog::load_parquet_dir_old(dir, 16).unwrap();
+
+    assert_eq!(cat_new.tables.len(), cat_old.tables.len());
+    for (name, table_new) in &cat_new.tables {
+        let table_old = cat_old
+            .get_table(name)
+            .unwrap_or_else(|| panic!("table {} missing in old catalog", name));
+        assert_eq!(table_new.rows, table_old.rows, "rows mismatch for {}", name);
+        assert_eq!(
+            table_new.batches.len(),
+            table_old.batches.len(),
+            "batch count mismatch for {}",
+            name
+        );
+        for (b_idx, (b_new, b_old)) in table_new.batches.iter().zip(&table_old.batches).enumerate()
+        {
+            assert_eq!(
+                b_new.len, b_old.len,
+                "batch len mismatch for {} batch {}",
+                name, b_idx
+            );
+            assert_eq!(b_new.columns.len(), b_old.columns.len());
+            for (c_idx, (c_new, c_old)) in b_new.columns.iter().zip(&b_old.columns).enumerate() {
+                assert_eq!(
+                    c_new.dtype, c_old.dtype,
+                    "dtype mismatch for {} batch {} col {}",
+                    name, b_idx, c_idx
+                );
+                assert_eq!(
+                    c_new.validity, c_old.validity,
+                    "validity mismatch for {} batch {} col {}",
+                    name, b_idx, c_idx
+                );
+                assert_eq!(
+                    c_new.data, c_old.data,
+                    "data mismatch for {} batch {} col {}",
+                    name, b_idx, c_idx
+                );
+            }
+        }
+    }
+}
