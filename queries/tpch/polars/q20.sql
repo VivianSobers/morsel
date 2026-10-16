@@ -23,10 +23,9 @@ valid_partsupp AS (
     JOIN
         forest_parts ON partsupp.ps_partkey = forest_parts.p_partkey
     JOIN
-        lineitem_sum ON partsupp.ps_partkey = lineitem_sum.l_partkey
+        lineitem_sum ON partsupp.ps_partkey = lineitem_sum.l_partkey AND partsupp.ps_suppkey = lineitem_sum.l_suppkey
     WHERE
-        partsupp.ps_suppkey = lineitem_sum.l_suppkey
-        AND CAST(partsupp.ps_availqty AS DOUBLE) > lineitem_sum.threshold_qty
+        CAST(partsupp.ps_availqty AS DOUBLE) > lineitem_sum.threshold_qty
 )
 SELECT
     s_name,
