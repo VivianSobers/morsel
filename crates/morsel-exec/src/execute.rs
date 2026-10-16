@@ -41,8 +41,24 @@ pub fn execute(plan: &LogicalPlan, catalog: &Catalog, threads: usize) -> Result<
             group_by,
             aggs,
         } => crate::aggregate::execute_aggregate(input, group_by, aggs, catalog, threads),
-        LogicalPlan::Join { .. } => bail!("unsupported plan variant: Join"),
-        LogicalPlan::CrossJoin { .. } => bail!("unsupported plan variant: CrossJoin"),
+        LogicalPlan::Join {
+            left,
+            right,
+            join_type,
+            on,
+            filter,
+        } => crate::join::execute_join(
+            left,
+            right,
+            *join_type,
+            on,
+            filter.as_ref(),
+            catalog,
+            threads,
+        ),
+        LogicalPlan::CrossJoin { left, right } => {
+            crate::join::execute_cross_join(left, right, catalog, threads)
+        }
         LogicalPlan::Sort { .. } => bail!("unsupported plan variant: Sort"),
     }
 }
