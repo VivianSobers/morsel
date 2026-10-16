@@ -97,8 +97,7 @@ def run_polars(args, queries: List[Tuple[int, str]]) -> Tuple[str, Any]:
     ctx = pl.SQLContext()
     for table in TPCH_TABLES:
         parquet_path = os.path.join(args.data_dir, f"{table}.parquet")
-        df = pl.read_parquet(parquet_path)
-        ctx.register(table, df)
+        ctx.register(table, pl.scan_parquet(parquet_path))
 
     def execute_fn(sql: str) -> List[List[Any]]:
         res_df = ctx.execute(sql).collect()
