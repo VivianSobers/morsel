@@ -14,14 +14,13 @@ FROM (
     JOIN
         supplier ON lineitem.l_suppkey = supplier.s_suppkey
     JOIN
-        partsupp ON lineitem.l_partkey = partsupp.ps_partkey
+        partsupp ON lineitem.l_partkey = partsupp.ps_partkey AND lineitem.l_suppkey = partsupp.ps_suppkey
     JOIN
         orders ON lineitem.l_orderkey = orders.o_orderkey
     JOIN
         nation ON supplier.s_nationkey = nation.n_nationkey
     WHERE
-        partsupp.ps_suppkey = lineitem.l_suppkey
-        AND p_name LIKE '%green%') AS profit
+        p_name LIKE '%green%') AS profit
 GROUP BY
     nation,
     o_year
