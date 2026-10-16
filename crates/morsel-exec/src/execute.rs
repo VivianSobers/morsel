@@ -30,8 +30,16 @@ pub fn apply_limit(batches: Vec<Batch>, n: usize) -> Vec<Batch> {
 pub fn execute(plan: &LogicalPlan, catalog: &Catalog, threads: usize) -> Result<Vec<Batch>> {
     match plan {
         LogicalPlan::Limit { input, n } => {
-            let batches = execute(input, catalog, threads)?;
-            Ok(apply_limit(batches, *n))
+            if let LogicalPlan::Sort {
+                input: sort_input,
+                keys,
+            } = input.as_ref()
+            {
+                crate::sort::execute_sort(sort_input, keys, catalog, threads, Some(*n))
+            } else {
+                let batches = execute(input, catalog, threads)?;
+                Ok(apply_limit(batches, *n))
+            }
         }
         LogicalPlan::Scan { .. } | LogicalPlan::Filter { .. } | LogicalPlan::Project { .. } => {
             execute_scan_pipeline(plan, catalog, threads)
@@ -59,7 +67,9 @@ pub fn execute(plan: &LogicalPlan, catalog: &Catalog, threads: usize) -> Result<
         LogicalPlan::CrossJoin { left, right } => {
             crate::join::execute_cross_join(left, right, catalog, threads)
         }
-        LogicalPlan::Sort { .. } => bail!("unsupported plan variant: Sort"),
+        LogicalPlan::Sort { input, keys } => {
+            crate::sort::execute_sort(input, keys, catalog, threads, None)
+        }
     }
 }
 

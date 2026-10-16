@@ -440,7 +440,7 @@ fn eval_comparison(op: BinOp, left: &Column, right: &Column, len: usize) -> Resu
     })
 }
 
-fn compare_scalars(a: &Scalar, b: &Scalar) -> Result<std::cmp::Ordering> {
+pub fn compare_scalars(a: &Scalar, b: &Scalar) -> Result<std::cmp::Ordering> {
     match (a, b) {
         (Scalar::Int32(x), Scalar::Int32(y)) => Ok(x.cmp(y)),
         (Scalar::Int64(x), Scalar::Int64(y)) => Ok(x.cmp(y)),
