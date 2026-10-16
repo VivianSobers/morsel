@@ -102,6 +102,93 @@ impl BatchBuilder {
     }
 }
 
+fn expr_referenced_columns(expr: &Expr, out: &mut Vec<usize>) {
+    match expr {
+        Expr::Column(idx) => out.push(*idx),
+        Expr::Literal(_) => {}
+        Expr::Binary { left, right, .. } => {
+            expr_referenced_columns(left, out);
+            expr_referenced_columns(right, out);
+        }
+        Expr::Not(e) | Expr::Negate(e) | Expr::IsNull(e) => expr_referenced_columns(e, out),
+        Expr::Like { expr, .. } => expr_referenced_columns(expr, out),
+        Expr::InList { expr, .. } => expr_referenced_columns(expr, out),
+        Expr::Case { whens, else_expr } => {
+            for (w, t) in whens {
+                expr_referenced_columns(w, out);
+                expr_referenced_columns(t, out);
+            }
+            if let Some(e) = else_expr {
+                expr_referenced_columns(e, out);
+            }
+        }
+        Expr::Cast { expr, .. } => expr_referenced_columns(expr, out),
+        Expr::Extract { expr, .. } => expr_referenced_columns(expr, out),
+        Expr::Substring { expr, .. } => expr_referenced_columns(expr, out),
+    }
+}
+
+fn expr_is_pure_right(expr: &Expr, l_cols_len: usize) -> bool {
+    let mut cols = Vec::new();
+    expr_referenced_columns(expr, &mut cols);
+    !cols.is_empty() && cols.iter().all(|&c| c >= l_cols_len)
+}
+
+fn shift_expr_columns(expr: &Expr, offset: usize) -> Expr {
+    match expr {
+        Expr::Column(idx) => Expr::Column(idx.saturating_sub(offset)),
+        Expr::Literal(s) => Expr::Literal(s.clone()),
+        Expr::Binary { op, left, right } => Expr::Binary {
+            op: *op,
+            left: Box::new(shift_expr_columns(left, offset)),
+            right: Box::new(shift_expr_columns(right, offset)),
+        },
+        Expr::Not(e) => Expr::Not(Box::new(shift_expr_columns(e, offset))),
+        Expr::Negate(e) => Expr::Negate(Box::new(shift_expr_columns(e, offset))),
+        Expr::IsNull(e) => Expr::IsNull(Box::new(shift_expr_columns(e, offset))),
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+        } => Expr::Like {
+            expr: Box::new(shift_expr_columns(expr, offset)),
+            pattern: pattern.clone(),
+            negated: *negated,
+        },
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: Box::new(shift_expr_columns(expr, offset)),
+            list: list.clone(),
+            negated: *negated,
+        },
+        Expr::Case { whens, else_expr } => Expr::Case {
+            whens: whens
+                .iter()
+                .map(|(w, t)| (shift_expr_columns(w, offset), shift_expr_columns(t, offset)))
+                .collect(),
+            else_expr: else_expr
+                .as_ref()
+                .map(|e| Box::new(shift_expr_columns(e, offset))),
+        },
+        Expr::Cast { expr, to } => Expr::Cast {
+            expr: Box::new(shift_expr_columns(expr, offset)),
+            to: *to,
+        },
+        Expr::Extract { field, expr } => Expr::Extract {
+            field: *field,
+            expr: Box::new(shift_expr_columns(expr, offset)),
+        },
+        Expr::Substring { expr, start, len } => Expr::Substring {
+            expr: Box::new(shift_expr_columns(expr, offset)),
+            start: *start,
+            len: *len,
+        },
+    }
+}
+
 fn test_filter_pair(
     filter: &Expr,
     left_batch: &Batch,
@@ -109,15 +196,21 @@ fn test_filter_pair(
     right_batches: &[Batch],
     loc: RowLoc,
     combined_schema: &Arc<Schema>,
+    referenced_cols: &[usize],
 ) -> Result<bool> {
     let mut cols = Vec::with_capacity(combined_schema.fields.len());
-    for col in &left_batch.columns {
-        let s = col.get(l_idx);
-        cols.push(Arc::new(Column::from_scalars(col.dtype, &[s])));
-    }
-    for col in &right_batches[loc.batch_idx as usize].columns {
-        let s = col.get(loc.row_idx as usize);
-        cols.push(Arc::new(Column::from_scalars(col.dtype, &[s])));
+    let l_len = left_batch.columns.len();
+    for (i, field) in combined_schema.fields.iter().enumerate() {
+        if referenced_cols.contains(&i) {
+            let s = if i < l_len {
+                left_batch.columns[i].get(l_idx)
+            } else {
+                right_batches[loc.batch_idx as usize].columns[i - l_len].get(loc.row_idx as usize)
+            };
+            cols.push(Arc::new(Column::from_scalars(field.dtype, &[s])));
+        } else {
+            cols.push(Arc::new(Column::from_scalars(field.dtype, &[Scalar::Null])));
+        }
     }
     let b = Batch::new(Arc::clone(combined_schema), cols);
     let sel = eval_predicate(filter, &b)?;
@@ -162,6 +255,20 @@ pub fn execute_join(
     let left_batches = execute(left, catalog, threads)?;
     let left_schema = left.schema()?;
     let right_schema = right.schema()?;
+    let l_cols_len = left_schema.fields.len();
+
+    let (right_filter, residual_filter) = match filter {
+        Some(f) if expr_is_pure_right(f, l_cols_len) => {
+            (Some(shift_expr_columns(f, l_cols_len)), None)
+        }
+        other => (None, other),
+    };
+    let mut referenced_cols = Vec::new();
+    if let Some(f) = residual_filter {
+        expr_referenced_columns(f, &mut referenced_cols);
+        referenced_cols.sort_unstable();
+        referenced_cols.dedup();
+    }
 
     let key_types: Vec<DataType> = on
         .iter()
@@ -206,6 +313,17 @@ pub fn execute_join(
     // Materialize build side hash table
     let mut hash_table: AHashMap<JoinKey, Vec<RowLoc>> = AHashMap::new();
     for (b_idx, r_batch) in right_batches.iter().enumerate() {
+        let filter_mask = if let Some(ref rf) = right_filter {
+            let sel = eval_predicate(rf, r_batch)?;
+            let mut mask = vec![false; r_batch.len];
+            for idx in sel {
+                mask[idx as usize] = true;
+            }
+            Some(mask)
+        } else {
+            None
+        };
+
         let r_key_cols: Vec<Column> = on
             .iter()
             .enumerate()
@@ -220,6 +338,11 @@ pub fn execute_join(
             .collect::<Result<Vec<_>>>()?;
 
         for r_idx in 0..r_batch.len {
+            if let Some(ref mask) = filter_mask {
+                if !mask[r_idx] {
+                    continue;
+                }
+            }
             if let Some(key) = extract_join_key(&r_key_cols, r_idx) {
                 hash_table.entry(key).or_default().push(RowLoc {
                     batch_idx: b_idx as u32,
@@ -256,6 +379,8 @@ pub fn execute_join(
             let k_types = &key_types;
             let l_cols_len = left_schema.fields.len();
             let r_cols_len = right_schema.fields.len();
+            let filter = residual_filter;
+            let ref_cols = &referenced_cols;
 
             s.spawn(move || loop {
                 if cancelled_ref.load(Ordering::Relaxed) {
@@ -308,6 +433,7 @@ pub fn execute_join(
                                         if let Some(f) = filter {
                                             match test_filter_pair(
                                                 f, l_batch, l_idx, r_batches, loc, comb_sch,
+                                                ref_cols,
                                             ) {
                                                 Ok(true) => {}
                                                 Ok(false) => continue,
@@ -339,6 +465,7 @@ pub fn execute_join(
                                         if let Some(f) = filter {
                                             match test_filter_pair(
                                                 f, l_batch, l_idx, r_batches, loc, comb_sch,
+                                                ref_cols,
                                             ) {
                                                 Ok(true) => {}
                                                 Ok(false) => continue,
@@ -378,6 +505,7 @@ pub fn execute_join(
                                         for &loc in matched_locs {
                                             match test_filter_pair(
                                                 f, l_batch, l_idx, r_batches, loc, comb_sch,
+                                                ref_cols,
                                             ) {
                                                 Ok(true) => {
                                                     matched = true;
@@ -411,6 +539,7 @@ pub fn execute_join(
                                         for &loc in matched_locs {
                                             match test_filter_pair(
                                                 f, l_batch, l_idx, r_batches, loc, comb_sch,
+                                                ref_cols,
                                             ) {
                                                 Ok(true) => {
                                                     has_matching_right = true;

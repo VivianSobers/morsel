@@ -324,6 +324,70 @@ fn like_patterns() {
 }
 
 #[test]
+fn like_matcher_specializations() {
+    let schema = Arc::new(Schema {
+        fields: vec![Field {
+            name: "s".to_string(),
+            dtype: DataType::Utf8,
+            nullable: false,
+        }],
+    });
+    let batch = Batch::new(
+        schema,
+        vec![Arc::new(Column::from_scalars(
+            DataType::Utf8,
+            &[
+                Scalar::Utf8("alpha_beta_gamma".to_string()),
+                Scalar::Utf8("hello world".to_string()),
+                Scalar::Utf8("hello".to_string()),
+                Scalar::Utf8("world".to_string()),
+                Scalar::Utf8("".to_string()),
+            ],
+        ))],
+    );
+
+    // Exact
+    let exact = Expr::Like {
+        expr: Box::new(Expr::Column(0)),
+        pattern: "hello".to_string(),
+        negated: false,
+    };
+    let res = eval(&exact, &batch).unwrap();
+    assert_eq!(res.get(2), Scalar::Bool(true));
+    assert_eq!(res.get(1), Scalar::Bool(false));
+
+    // Multi contains: %hello%world%
+    let multi = Expr::Like {
+        expr: Box::new(Expr::Column(0)),
+        pattern: "%hello%world%".to_string(),
+        negated: false,
+    };
+    let res = eval(&multi, &batch).unwrap();
+    assert_eq!(res.get(1), Scalar::Bool(true));
+    assert_eq!(res.get(2), Scalar::Bool(false));
+
+    // Starts with and ends with: hello%world
+    let se = Expr::Like {
+        expr: Box::new(Expr::Column(0)),
+        pattern: "hello%world".to_string(),
+        negated: false,
+    };
+    let res = eval(&se, &batch).unwrap();
+    assert_eq!(res.get(1), Scalar::Bool(true));
+    assert_eq!(res.get(2), Scalar::Bool(false));
+
+    // Wildcard %
+    let all = Expr::Like {
+        expr: Box::new(Expr::Column(0)),
+        pattern: "%".to_string(),
+        negated: false,
+    };
+    let res = eval(&all, &batch).unwrap();
+    assert_eq!(res.get(0), Scalar::Bool(true));
+    assert_eq!(res.get(4), Scalar::Bool(true));
+}
+
+#[test]
 fn in_list_and_negated() {
     let schema = Arc::new(Schema {
         fields: vec![Field {

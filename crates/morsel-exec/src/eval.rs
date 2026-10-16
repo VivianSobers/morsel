@@ -1,3 +1,7 @@
+use std::cell::RefCell;
+use std::sync::Arc;
+
+use ahash::AHashMap;
 use anyhow::{bail, Result};
 use chrono::Datelike;
 use morsel_core::{Batch, Column, ColumnData, DataType, Scalar};
@@ -50,6 +54,127 @@ fn like_to_regex(pattern: &str) -> Result<Regex> {
     }
     regex_str.push('$');
     Regex::new(&regex_str).map_err(|e| anyhow::anyhow!("invalid like pattern: {}", e))
+}
+
+#[derive(Clone, Debug)]
+pub enum LikeMatcher {
+    AlwaysTrue,
+    Exact(String),
+    Sequence {
+        prefix: Option<String>,
+        middle: Vec<String>,
+        suffix: Option<String>,
+    },
+    Regex(Regex),
+}
+
+impl LikeMatcher {
+    pub fn compile(pattern: &str) -> Result<Self> {
+        if pattern.contains('_') || pattern.contains('\\') {
+            let re = like_to_regex(pattern)?;
+            return Ok(LikeMatcher::Regex(re));
+        }
+
+        if !pattern.contains('%') {
+            return Ok(LikeMatcher::Exact(pattern.to_string()));
+        }
+
+        let starts_with_pct = pattern.starts_with('%');
+        let ends_with_pct = pattern.ends_with('%');
+
+        let parts: Vec<&str> = pattern.split('%').filter(|s| !s.is_empty()).collect();
+
+        if parts.is_empty() {
+            return Ok(LikeMatcher::AlwaysTrue);
+        }
+
+        let prefix = if starts_with_pct {
+            None
+        } else {
+            Some(parts[0].to_string())
+        };
+
+        let suffix = if ends_with_pct || (!starts_with_pct && parts.len() == 1) {
+            None
+        } else {
+            Some(parts.last().unwrap().to_string())
+        };
+
+        let start_idx = if prefix.is_some() { 1 } else { 0 };
+        let end_idx = if suffix.is_some() {
+            parts.len().saturating_sub(1)
+        } else {
+            parts.len()
+        };
+
+        let middle = if start_idx < end_idx {
+            parts[start_idx..end_idx]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        Ok(LikeMatcher::Sequence {
+            prefix,
+            middle,
+            suffix,
+        })
+    }
+
+    #[inline]
+    pub fn is_match(&self, s: &str) -> bool {
+        match self {
+            LikeMatcher::AlwaysTrue => true,
+            LikeMatcher::Exact(lit) => s == lit,
+            LikeMatcher::Sequence {
+                prefix,
+                middle,
+                suffix,
+            } => {
+                let mut curr = s;
+                if let Some(ref pfx) = prefix {
+                    if !curr.starts_with(pfx) {
+                        return false;
+                    }
+                    curr = &curr[pfx.len()..];
+                }
+                if let Some(ref sfx) = suffix {
+                    if curr.len() < sfx.len() || !curr.ends_with(sfx) {
+                        return false;
+                    }
+                    curr = &curr[..curr.len() - sfx.len()];
+                }
+                for part in middle {
+                    if let Some(pos) = curr.find(part.as_str()) {
+                        curr = &curr[pos + part.len()..];
+                    } else {
+                        return false;
+                    }
+                }
+                true
+            }
+            LikeMatcher::Regex(re) => re.is_match(s),
+        }
+    }
+}
+
+thread_local! {
+    static LIKE_CACHE: RefCell<AHashMap<String, Arc<LikeMatcher>>> =
+        RefCell::new(AHashMap::new());
+}
+
+pub fn get_like_matcher(pattern: &str) -> Result<Arc<LikeMatcher>> {
+    LIKE_CACHE.with(|cache| {
+        let mut map = cache.borrow_mut();
+        if let Some(m) = map.get(pattern) {
+            return Ok(Arc::clone(m));
+        }
+        let matcher = Arc::new(LikeMatcher::compile(pattern)?);
+        map.insert(pattern.to_string(), Arc::clone(&matcher));
+        Ok(matcher)
+    })
 }
 
 fn date32_to_year(days: i32) -> i64 {
@@ -215,7 +340,7 @@ pub fn eval(expr: &Expr, batch: &Batch) -> Result<Column> {
             negated,
         } => {
             let col = eval(expr, batch)?;
-            let regex = like_to_regex(pattern)?;
+            let matcher = get_like_matcher(pattern)?;
             let mut data = Vec::with_capacity(row_count);
             let mut validity = Vec::with_capacity(row_count);
             let mut has_null = false;
@@ -228,7 +353,7 @@ pub fn eval(expr: &Expr, batch: &Batch) -> Result<Column> {
                 } else {
                     validity.push(true);
                     let s = col.utf8_value(i);
-                    let is_match = regex.is_match(s);
+                    let is_match = matcher.is_match(s);
                     data.push(if *negated { !is_match } else { is_match });
                 }
             }
