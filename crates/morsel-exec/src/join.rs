@@ -310,49 +310,85 @@ pub fn execute_join(
         },
     });
 
+    let left_total_rows: usize = left_batches.iter().map(|b| b.len).sum();
+    let right_total_rows: usize = right_batches.iter().map(|b| b.len).sum();
+    let build_on_left = matches!(join_type, JoinType::Inner) && left_total_rows < right_total_rows;
+
     // Materialize build side hash table
     let mut hash_table: AHashMap<JoinKey, Vec<RowLoc>> = AHashMap::new();
-    for (b_idx, r_batch) in right_batches.iter().enumerate() {
-        let filter_mask = if let Some(ref rf) = right_filter {
-            let sel = eval_predicate(rf, r_batch)?;
-            let mut mask = vec![false; r_batch.len];
-            for idx in sel {
-                mask[idx as usize] = true;
-            }
-            Some(mask)
-        } else {
-            None
-        };
+    if build_on_left {
+        for (b_idx, l_batch) in left_batches.iter().enumerate() {
+            let l_key_cols: Vec<Column> = on
+                .iter()
+                .enumerate()
+                .map(|(k, (l_expr, _))| {
+                    let col = eval(l_expr, l_batch)?;
+                    if col.dtype != key_types[k] {
+                        cast_column(&col, key_types[k])
+                    } else {
+                        Ok(col)
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
 
-        let r_key_cols: Vec<Column> = on
-            .iter()
-            .enumerate()
-            .map(|(k, (_, r_expr))| {
-                let col = eval(r_expr, r_batch)?;
-                if col.dtype != key_types[k] {
-                    cast_column(&col, key_types[k])
-                } else {
-                    Ok(col)
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        for r_idx in 0..r_batch.len {
-            if let Some(ref mask) = filter_mask {
-                if !mask[r_idx] {
-                    continue;
+            for l_idx in 0..l_batch.len {
+                if let Some(key) = extract_join_key(&l_key_cols, l_idx) {
+                    hash_table.entry(key).or_default().push(RowLoc {
+                        batch_idx: b_idx as u32,
+                        row_idx: l_idx as u32,
+                    });
                 }
             }
-            if let Some(key) = extract_join_key(&r_key_cols, r_idx) {
-                hash_table.entry(key).or_default().push(RowLoc {
-                    batch_idx: b_idx as u32,
-                    row_idx: r_idx as u32,
-                });
+        }
+    } else {
+        for (b_idx, r_batch) in right_batches.iter().enumerate() {
+            let filter_mask = if let Some(ref rf) = right_filter {
+                let sel = eval_predicate(rf, r_batch)?;
+                let mut mask = vec![false; r_batch.len];
+                for idx in sel {
+                    mask[idx as usize] = true;
+                }
+                Some(mask)
+            } else {
+                None
+            };
+
+            let r_key_cols: Vec<Column> = on
+                .iter()
+                .enumerate()
+                .map(|(k, (_, r_expr))| {
+                    let col = eval(r_expr, r_batch)?;
+                    if col.dtype != key_types[k] {
+                        cast_column(&col, key_types[k])
+                    } else {
+                        Ok(col)
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            for r_idx in 0..r_batch.len {
+                if let Some(ref mask) = filter_mask {
+                    if !mask[r_idx] {
+                        continue;
+                    }
+                }
+                if let Some(key) = extract_join_key(&r_key_cols, r_idx) {
+                    hash_table.entry(key).or_default().push(RowLoc {
+                        batch_idx: b_idx as u32,
+                        row_idx: r_idx as u32,
+                    });
+                }
             }
         }
     }
 
-    let morsels = create_morsels(&left_batches);
+    let probe_batches = if build_on_left {
+        &right_batches
+    } else {
+        &left_batches
+    };
+
+    let morsels = create_morsels(probe_batches);
     if morsels.is_empty() {
         return Ok(Vec::new());
     }
@@ -373,6 +409,7 @@ pub fn execute_join(
             let err_cell = &error_cell;
             let cancelled_ref = &cancelled;
             let ht = &hash_table;
+            let l_batches = &left_batches;
             let r_batches = &right_batches;
             let out_sch = &out_schema;
             let comb_sch = &combined_schema;
@@ -381,6 +418,7 @@ pub fn execute_join(
             let r_cols_len = right_schema.fields.len();
             let filter = residual_filter;
             let ref_cols = &referenced_cols;
+            let r_filter = right_filter.as_ref();
 
             s.spawn(move || loop {
                 if cancelled_ref.load(Ordering::Relaxed) {
@@ -394,182 +432,294 @@ pub fn execute_join(
 
                 let mut builder = BatchBuilder::new(Arc::clone(out_sch));
 
-                for l_batch in &morsel.batches {
-                    let l_key_cols: Vec<Column> = match on
-                        .iter()
-                        .enumerate()
-                        .map(|(k, (l_expr, _))| {
-                            let col = eval(l_expr, l_batch)?;
-                            if col.dtype != k_types[k] {
-                                cast_column(&col, k_types[k])
-                            } else {
-                                Ok(col)
+                if build_on_left {
+                    for r_batch in &morsel.batches {
+                        let filter_mask = if let Some(rf) = r_filter {
+                            match eval_predicate(rf, r_batch) {
+                                Ok(sel) => {
+                                    let mut mask = vec![false; r_batch.len];
+                                    for idx in sel {
+                                        mask[idx as usize] = true;
+                                    }
+                                    Some(mask)
+                                }
+                                Err(e) => {
+                                    let mut locked_err = err_cell.lock().unwrap();
+                                    if locked_err.is_none() {
+                                        *locked_err = Some(e);
+                                    }
+                                    cancelled_ref.store(true, Ordering::Relaxed);
+                                    break;
+                                }
                             }
-                        })
-                        .collect::<Result<Vec<_>>>()
-                    {
-                        Ok(cols) => cols,
-                        Err(e) => {
-                            let mut locked_err = err_cell.lock().unwrap();
-                            if locked_err.is_none() {
-                                *locked_err = Some(e);
-                            }
-                            cancelled_ref.store(true, Ordering::Relaxed);
-                            break;
-                        }
-                    };
-
-                    for l_idx in 0..l_batch.len {
-                        let locs: Option<&Vec<RowLoc>> = match extract_join_key(&l_key_cols, l_idx)
-                        {
-                            Some(ref key) => ht.get(key),
-                            None => None,
+                        } else {
+                            None
                         };
 
-                        match join_type {
-                            JoinType::Inner => {
-                                if let Some(matched_locs) = locs {
-                                    for &loc in matched_locs {
-                                        if let Some(f) = filter {
-                                            match test_filter_pair(
-                                                f, l_batch, l_idx, r_batches, loc, comb_sch,
-                                                ref_cols,
-                                            ) {
-                                                Ok(true) => {}
-                                                Ok(false) => continue,
-                                                Err(e) => {
-                                                    let mut locked_err = err_cell.lock().unwrap();
-                                                    if locked_err.is_none() {
-                                                        *locked_err = Some(e);
-                                                    }
-                                                    cancelled_ref.store(true, Ordering::Relaxed);
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        builder.push_row(
-                                            (0..l_cols_len)
-                                                .map(|c| l_batch.columns[c].get(l_idx))
-                                                .chain((0..r_cols_len).map(|c| {
-                                                    r_batches[loc.batch_idx as usize].columns[c]
-                                                        .get(loc.row_idx as usize)
-                                                })),
-                                        );
-                                    }
+                        let r_key_cols: Vec<Column> = match on
+                            .iter()
+                            .enumerate()
+                            .map(|(k, (_, r_expr))| {
+                                let col = eval(r_expr, r_batch)?;
+                                if col.dtype != k_types[k] {
+                                    cast_column(&col, k_types[k])
+                                } else {
+                                    Ok(col)
+                                }
+                            })
+                            .collect::<Result<Vec<_>>>()
+                        {
+                            Ok(cols) => cols,
+                            Err(e) => {
+                                let mut locked_err = err_cell.lock().unwrap();
+                                if locked_err.is_none() {
+                                    *locked_err = Some(e);
+                                }
+                                cancelled_ref.store(true, Ordering::Relaxed);
+                                break;
+                            }
+                        };
+
+                        for r_idx in 0..r_batch.len {
+                            if let Some(ref mask) = filter_mask {
+                                if !mask[r_idx] {
+                                    continue;
                                 }
                             }
-                            JoinType::Left => {
-                                let mut matched = false;
-                                if let Some(matched_locs) = locs {
-                                    for &loc in matched_locs {
-                                        if let Some(f) = filter {
-                                            match test_filter_pair(
-                                                f, l_batch, l_idx, r_batches, loc, comb_sch,
-                                                ref_cols,
-                                            ) {
-                                                Ok(true) => {}
-                                                Ok(false) => continue,
-                                                Err(e) => {
-                                                    let mut locked_err = err_cell.lock().unwrap();
-                                                    if locked_err.is_none() {
-                                                        *locked_err = Some(e);
-                                                    }
-                                                    cancelled_ref.store(true, Ordering::Relaxed);
-                                                    break;
+                            let locs: Option<&Vec<RowLoc>> =
+                                match extract_join_key(&r_key_cols, r_idx) {
+                                    Some(ref key) => ht.get(key),
+                                    None => None,
+                                };
+
+                            if let Some(matched_locs) = locs {
+                                for &loc in matched_locs {
+                                    let l_batch = &l_batches[loc.batch_idx as usize];
+                                    let l_idx = loc.row_idx as usize;
+                                    if let Some(f) = filter {
+                                        match test_filter_pair(
+                                            f,
+                                            l_batch,
+                                            l_idx,
+                                            std::slice::from_ref(r_batch),
+                                            RowLoc {
+                                                batch_idx: 0,
+                                                row_idx: r_idx as u32,
+                                            },
+                                            comb_sch,
+                                            ref_cols,
+                                        ) {
+                                            Ok(true) => {}
+                                            Ok(false) => continue,
+                                            Err(e) => {
+                                                let mut locked_err = err_cell.lock().unwrap();
+                                                if locked_err.is_none() {
+                                                    *locked_err = Some(e);
                                                 }
+                                                cancelled_ref.store(true, Ordering::Relaxed);
+                                                break;
                                             }
                                         }
-                                        matched = true;
-                                        builder.push_row(
-                                            (0..l_cols_len)
-                                                .map(|c| l_batch.columns[c].get(l_idx))
-                                                .chain((0..r_cols_len).map(|c| {
-                                                    r_batches[loc.batch_idx as usize].columns[c]
-                                                        .get(loc.row_idx as usize)
-                                                })),
-                                        );
                                     }
-                                }
-                                if !matched {
                                     builder.push_row(
                                         (0..l_cols_len)
                                             .map(|c| l_batch.columns[c].get(l_idx))
-                                            .chain((0..r_cols_len).map(|_| Scalar::Null)),
-                                    );
-                                }
-                            }
-                            JoinType::Semi => {
-                                let mut matched = false;
-                                if let Some(matched_locs) = locs {
-                                    if let Some(f) = filter {
-                                        for &loc in matched_locs {
-                                            match test_filter_pair(
-                                                f, l_batch, l_idx, r_batches, loc, comb_sch,
-                                                ref_cols,
-                                            ) {
-                                                Ok(true) => {
-                                                    matched = true;
-                                                    break;
-                                                }
-                                                Ok(false) => {}
-                                                Err(e) => {
-                                                    let mut locked_err = err_cell.lock().unwrap();
-                                                    if locked_err.is_none() {
-                                                        *locked_err = Some(e);
-                                                    }
-                                                    cancelled_ref.store(true, Ordering::Relaxed);
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    } else if !matched_locs.is_empty() {
-                                        matched = true;
-                                    }
-                                }
-                                if matched {
-                                    builder.push_row(
-                                        (0..l_cols_len).map(|c| l_batch.columns[c].get(l_idx)),
-                                    );
-                                }
-                            }
-                            JoinType::Anti => {
-                                let mut has_matching_right = false;
-                                if let Some(matched_locs) = locs {
-                                    if let Some(f) = filter {
-                                        for &loc in matched_locs {
-                                            match test_filter_pair(
-                                                f, l_batch, l_idx, r_batches, loc, comb_sch,
-                                                ref_cols,
-                                            ) {
-                                                Ok(true) => {
-                                                    has_matching_right = true;
-                                                    break;
-                                                }
-                                                Ok(false) => {}
-                                                Err(e) => {
-                                                    let mut locked_err = err_cell.lock().unwrap();
-                                                    if locked_err.is_none() {
-                                                        *locked_err = Some(e);
-                                                    }
-                                                    cancelled_ref.store(true, Ordering::Relaxed);
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    } else if !matched_locs.is_empty() {
-                                        has_matching_right = true;
-                                    }
-                                }
-                                if !has_matching_right {
-                                    builder.push_row(
-                                        (0..l_cols_len).map(|c| l_batch.columns[c].get(l_idx)),
+                                            .chain(
+                                                (0..r_cols_len)
+                                                    .map(|c| r_batch.columns[c].get(r_idx)),
+                                            ),
                                     );
                                 }
                             }
                         }
                     }
+                } else {
+                    for l_batch in &morsel.batches {
+                        let l_key_cols: Vec<Column> = match on
+                            .iter()
+                            .enumerate()
+                            .map(|(k, (l_expr, _))| {
+                                let col = eval(l_expr, l_batch)?;
+                                if col.dtype != k_types[k] {
+                                    cast_column(&col, k_types[k])
+                                } else {
+                                    Ok(col)
+                                }
+                            })
+                            .collect::<Result<Vec<_>>>()
+                        {
+                            Ok(cols) => cols,
+                            Err(e) => {
+                                let mut locked_err = err_cell.lock().unwrap();
+                                if locked_err.is_none() {
+                                    *locked_err = Some(e);
+                                }
+                                cancelled_ref.store(true, Ordering::Relaxed);
+                                break;
+                            }
+                        };
+
+                        for l_idx in 0..l_batch.len {
+                            let locs: Option<&Vec<RowLoc>> =
+                                match extract_join_key(&l_key_cols, l_idx) {
+                                    Some(ref key) => ht.get(key),
+                                    None => None,
+                                };
+
+                            match join_type {
+                                JoinType::Inner => {
+                                    if let Some(matched_locs) = locs {
+                                        for &loc in matched_locs {
+                                            if let Some(f) = filter {
+                                                match test_filter_pair(
+                                                    f, l_batch, l_idx, r_batches, loc, comb_sch,
+                                                    ref_cols,
+                                                ) {
+                                                    Ok(true) => {}
+                                                    Ok(false) => continue,
+                                                    Err(e) => {
+                                                        let mut locked_err =
+                                                            err_cell.lock().unwrap();
+                                                        if locked_err.is_none() {
+                                                            *locked_err = Some(e);
+                                                        }
+                                                        cancelled_ref
+                                                            .store(true, Ordering::Relaxed);
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            builder.push_row(
+                                                (0..l_cols_len)
+                                                    .map(|c| l_batch.columns[c].get(l_idx))
+                                                    .chain((0..r_cols_len).map(|c| {
+                                                        r_batches[loc.batch_idx as usize].columns[c]
+                                                            .get(loc.row_idx as usize)
+                                                    })),
+                                            );
+                                        }
+                                    }
+                                }
+                                JoinType::Left => {
+                                    let mut matched = false;
+                                    if let Some(matched_locs) = locs {
+                                        for &loc in matched_locs {
+                                            if let Some(f) = filter {
+                                                match test_filter_pair(
+                                                    f, l_batch, l_idx, r_batches, loc, comb_sch,
+                                                    ref_cols,
+                                                ) {
+                                                    Ok(true) => {}
+                                                    Ok(false) => continue,
+                                                    Err(e) => {
+                                                        let mut locked_err =
+                                                            err_cell.lock().unwrap();
+                                                        if locked_err.is_none() {
+                                                            *locked_err = Some(e);
+                                                        }
+                                                        cancelled_ref
+                                                            .store(true, Ordering::Relaxed);
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            matched = true;
+                                            builder.push_row(
+                                                (0..l_cols_len)
+                                                    .map(|c| l_batch.columns[c].get(l_idx))
+                                                    .chain((0..r_cols_len).map(|c| {
+                                                        r_batches[loc.batch_idx as usize].columns[c]
+                                                            .get(loc.row_idx as usize)
+                                                    })),
+                                            );
+                                        }
+                                    }
+                                    if !matched {
+                                        builder.push_row(
+                                            (0..l_cols_len)
+                                                .map(|c| l_batch.columns[c].get(l_idx))
+                                                .chain((0..r_cols_len).map(|_| Scalar::Null)),
+                                        );
+                                    }
+                                }
+                                JoinType::Semi => {
+                                    let mut matched = false;
+                                    if let Some(matched_locs) = locs {
+                                        if let Some(f) = filter {
+                                            for &loc in matched_locs {
+                                                match test_filter_pair(
+                                                    f, l_batch, l_idx, r_batches, loc, comb_sch,
+                                                    ref_cols,
+                                                ) {
+                                                    Ok(true) => {
+                                                        matched = true;
+                                                        break;
+                                                    }
+                                                    Ok(false) => {}
+                                                    Err(e) => {
+                                                        let mut locked_err =
+                                                            err_cell.lock().unwrap();
+                                                        if locked_err.is_none() {
+                                                            *locked_err = Some(e);
+                                                        }
+                                                        cancelled_ref
+                                                            .store(true, Ordering::Relaxed);
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        } else if !matched_locs.is_empty() {
+                                            matched = true;
+                                        }
+                                    }
+                                    if matched {
+                                        builder.push_row(
+                                            (0..l_cols_len).map(|c| l_batch.columns[c].get(l_idx)),
+                                        );
+                                    }
+                                }
+                                JoinType::Anti => {
+                                    let mut has_matching_right = false;
+                                    if let Some(matched_locs) = locs {
+                                        if let Some(f) = filter {
+                                            for &loc in matched_locs {
+                                                match test_filter_pair(
+                                                    f, l_batch, l_idx, r_batches, loc, comb_sch,
+                                                    ref_cols,
+                                                ) {
+                                                    Ok(true) => {
+                                                        has_matching_right = true;
+                                                        break;
+                                                    }
+                                                    Ok(false) => {}
+                                                    Err(e) => {
+                                                        let mut locked_err =
+                                                            err_cell.lock().unwrap();
+                                                        if locked_err.is_none() {
+                                                            *locked_err = Some(e);
+                                                        }
+                                                        cancelled_ref
+                                                            .store(true, Ordering::Relaxed);
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        } else if !matched_locs.is_empty() {
+                                            has_matching_right = true;
+                                        }
+                                    }
+                                    if !has_matching_right {
+                                        builder.push_row(
+                                            (0..l_cols_len).map(|c| l_batch.columns[c].get(l_idx)),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
-                *res_ref[morsel.id].lock().unwrap() = builder.finish();
+                let fin = builder.finish();
+                *res_ref[morsel.id].lock().unwrap() = fin;
             });
         }
     });

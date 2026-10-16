@@ -511,3 +511,97 @@ fn agg_state_merge_handles_incompatible_scalars() {
     let res = s1.merge(s2);
     assert!(res.is_err());
 }
+
+#[test]
+fn test_parallel_aggregate_tree_merge() {
+    let schema = Arc::new(Schema {
+        fields: vec![
+            Field {
+                name: "g".to_string(),
+                dtype: DataType::Int64,
+                nullable: false,
+            },
+            Field {
+                name: "v".to_string(),
+                dtype: DataType::Int64,
+                nullable: false,
+            },
+        ],
+    });
+
+    let num_batches = 32;
+    let rows_per_batch = 2048;
+    let mut batches = Vec::with_capacity(num_batches);
+    for b in 0..num_batches {
+        let g_vals: Vec<Scalar> = (0..rows_per_batch)
+            .map(|i| Scalar::Int64(((b * 1000 + i) % 5000) as i64))
+            .collect();
+        let v_vals: Vec<Scalar> = (0..rows_per_batch)
+            .map(|i| Scalar::Int64((i + 1) as i64))
+            .collect();
+        let col_g = Arc::new(Column::from_scalars(DataType::Int64, &g_vals));
+        let col_v = Arc::new(Column::from_scalars(DataType::Int64, &v_vals));
+        batches.push(Batch::new(Arc::clone(&schema), vec![col_g, col_v]));
+    }
+    let table = make_table(Arc::clone(&schema), batches);
+    let mut tables = HashMap::new();
+    let table_schema = (*table.schema).clone();
+    tables.insert("t".to_string(), table);
+    let catalog = Catalog { tables };
+
+    let scan = LogicalPlan::Scan {
+        table: "t".to_string(),
+        columns: vec![0, 1],
+        table_schema,
+    };
+    let agg = LogicalPlan::Aggregate {
+        input: Box::new(scan),
+        group_by: vec![(Expr::Column(0), "g".to_string())],
+        aggs: vec![
+            (
+                AggExpr {
+                    func: AggFunc::Count,
+                    arg: Some(Expr::Column(1)),
+                },
+                "cnt".to_string(),
+            ),
+            (
+                AggExpr {
+                    func: AggFunc::Sum,
+                    arg: Some(Expr::Column(1)),
+                },
+                "sum".to_string(),
+            ),
+        ],
+    };
+
+    let res1 = execute(&agg, &catalog, 1).unwrap();
+    let res16 = execute(&agg, &catalog, 16).unwrap();
+
+    let to_map = |batches: &[Batch]| -> HashMap<i64, (i64, i64)> {
+        let mut m = HashMap::new();
+        for b in batches {
+            for i in 0..b.len {
+                let g = match b.columns[0].get(i) {
+                    Scalar::Int64(x) => x,
+                    _ => unreachable!(),
+                };
+                let c = match b.columns[1].get(i) {
+                    Scalar::Int64(x) => x,
+                    _ => unreachable!(),
+                };
+                let s = match b.columns[2].get(i) {
+                    Scalar::Int64(x) => x,
+                    _ => unreachable!(),
+                };
+                m.insert(g, (c, s));
+            }
+        }
+        m
+    };
+
+    let map1 = to_map(&res1);
+    let map16 = to_map(&res16);
+    assert_eq!(map1.len(), 5000);
+    assert_eq!(map1, map16);
+}
