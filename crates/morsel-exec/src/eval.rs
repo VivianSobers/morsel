@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 use chrono::Datelike;
 use morsel_core::{Batch, Column, ColumnData, DataType, Scalar};
-use morsel_plan::{BinOp, DateField, Expr};
+use morsel_plan::{binary_op_type, BinOp, DateField, Expr};
 use regex::Regex;
 
 fn pow10(n: u8) -> i128 {
@@ -659,21 +659,7 @@ fn eval_arithmetic(op: BinOp, left: &Column, right: &Column, len: usize) -> Resu
         }
     }
 
-    let out_dtype = if let Some(first_non_null) = scalars.iter().find(|s| !s.is_null()) {
-        match first_non_null {
-            Scalar::Decimal(_, s) => DataType::Decimal {
-                precision: 38,
-                scale: *s,
-            },
-            Scalar::Int32(_) => DataType::Int32,
-            Scalar::Int64(_) => DataType::Int64,
-            Scalar::Float64(_) => DataType::Float64,
-            Scalar::Date32(_) => DataType::Date32,
-            _ => DataType::Int32,
-        }
-    } else {
-        DataType::Int32
-    };
+    let out_dtype = binary_op_type(op, &left.dtype, &right.dtype)?;
 
     Ok(Column::from_scalars(out_dtype, &scalars))
 }

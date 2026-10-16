@@ -578,3 +578,62 @@ fn float_mul_decimal() {
     assert_eq!(res.dtype, DataType::Float64);
     assert_eq!(res.get(0), Scalar::Float64(500.0));
 }
+
+#[test]
+fn all_null_batch_preserves_arithmetic_type() {
+    let schema = Arc::new(Schema {
+        fields: vec![
+            Field {
+                name: "a".to_string(),
+                dtype: DataType::Decimal {
+                    precision: 15,
+                    scale: 2,
+                },
+                nullable: true,
+            },
+            Field {
+                name: "b".to_string(),
+                dtype: DataType::Decimal {
+                    precision: 15,
+                    scale: 2,
+                },
+                nullable: true,
+            },
+        ],
+    });
+
+    let batch = Batch::new(
+        schema,
+        vec![
+            Arc::new(Column::from_scalars(
+                DataType::Decimal {
+                    precision: 15,
+                    scale: 2,
+                },
+                &[Scalar::Null],
+            )),
+            Arc::new(Column::from_scalars(
+                DataType::Decimal {
+                    precision: 15,
+                    scale: 2,
+                },
+                &[Scalar::Null],
+            )),
+        ],
+    );
+
+    let expr = Expr::Binary {
+        op: BinOp::Add,
+        left: Box::new(Expr::Column(0)),
+        right: Box::new(Expr::Column(1)),
+    };
+
+    let col = eval(&expr, &batch).unwrap();
+    assert_eq!(
+        col.dtype,
+        DataType::Decimal {
+            precision: 38,
+            scale: 2
+        }
+    );
+}

@@ -89,63 +89,7 @@ impl Expr {
             Expr::Binary { op, left, right } => {
                 let lt = left.data_type(input)?;
                 let rt = right.data_type(input)?;
-                match op {
-                    BinOp::Eq
-                    | BinOp::NotEq
-                    | BinOp::Lt
-                    | BinOp::LtEq
-                    | BinOp::Gt
-                    | BinOp::GtEq
-                    | BinOp::And
-                    | BinOp::Or => Ok(DataType::Bool),
-                    BinOp::Div => Ok(DataType::Float64),
-                    BinOp::Add | BinOp::Sub => match (lt, rt) {
-                        (
-                            DataType::Decimal { scale: s1, .. },
-                            DataType::Decimal { scale: s2, .. },
-                        ) => Ok(DataType::Decimal {
-                            precision: 38,
-                            scale: s1.max(s2),
-                        }),
-                        (DataType::Decimal { scale, .. }, DataType::Int32 | DataType::Int64)
-                        | (DataType::Int32 | DataType::Int64, DataType::Decimal { scale, .. }) => {
-                            Ok(DataType::Decimal {
-                                precision: 38,
-                                scale,
-                            })
-                        }
-                        (DataType::Int64, DataType::Int32 | DataType::Int64)
-                        | (DataType::Int32, DataType::Int64) => Ok(DataType::Int64),
-                        (DataType::Int32, DataType::Int32) => Ok(DataType::Int32),
-                        (DataType::Float64, _) | (_, DataType::Float64) => Ok(DataType::Float64),
-                        (DataType::Date32, DataType::Int32 | DataType::Int64) => {
-                            Ok(DataType::Date32)
-                        }
-                        (DataType::Date32, DataType::Date32) => Ok(DataType::Int32),
-                        _ => bail!("unsupported binary op {:?} on {:?} and {:?}", op, lt, rt),
-                    },
-                    BinOp::Mul => match (lt, rt) {
-                        (
-                            DataType::Decimal { scale: s1, .. },
-                            DataType::Decimal { scale: s2, .. },
-                        ) => Ok(DataType::Decimal {
-                            precision: 38,
-                            scale: s1 + s2,
-                        }),
-                        (DataType::Decimal { scale, .. }, DataType::Int32 | DataType::Int64)
-                        | (DataType::Int32 | DataType::Int64, DataType::Decimal { scale, .. }) => {
-                            Ok(DataType::Decimal {
-                                precision: 38,
-                                scale,
-                            })
-                        }
-                        (DataType::Int64, DataType::Int32 | DataType::Int64)
-                        | (DataType::Int32, DataType::Int64) => Ok(DataType::Int64),
-                        (DataType::Int32, DataType::Int32) => Ok(DataType::Int32),
-                        (DataType::Float64, _) | (_, DataType::Float64) => Ok(DataType::Float64),
-                        _ => bail!("unsupported binary op Mul on {:?} and {:?}", lt, rt),
-                    },
-                }
+                binary_op_type(*op, &lt, &rt)
             }
             Expr::Not(_) => Ok(DataType::Bool),
             Expr::Negate(expr) => expr.data_type(input),
@@ -165,5 +109,61 @@ impl Expr {
             Expr::Extract { .. } => Ok(DataType::Int64),
             Expr::Substring { .. } => Ok(DataType::Utf8),
         }
+    }
+}
+
+pub fn binary_op_type(op: BinOp, lt: &DataType, rt: &DataType) -> Result<DataType> {
+    match op {
+        BinOp::Eq
+        | BinOp::NotEq
+        | BinOp::Lt
+        | BinOp::LtEq
+        | BinOp::Gt
+        | BinOp::GtEq
+        | BinOp::And
+        | BinOp::Or => Ok(DataType::Bool),
+        BinOp::Div => Ok(DataType::Float64),
+        BinOp::Add | BinOp::Sub => match (lt, rt) {
+            (DataType::Decimal { scale: s1, .. }, DataType::Decimal { scale: s2, .. }) => {
+                Ok(DataType::Decimal {
+                    precision: 38,
+                    scale: *s1.max(s2),
+                })
+            }
+            (DataType::Decimal { scale, .. }, DataType::Int32 | DataType::Int64)
+            | (DataType::Int32 | DataType::Int64, DataType::Decimal { scale, .. }) => {
+                Ok(DataType::Decimal {
+                    precision: 38,
+                    scale: *scale,
+                })
+            }
+            (DataType::Int64, DataType::Int32 | DataType::Int64)
+            | (DataType::Int32, DataType::Int64) => Ok(DataType::Int64),
+            (DataType::Int32, DataType::Int32) => Ok(DataType::Int32),
+            (DataType::Float64, _) | (_, DataType::Float64) => Ok(DataType::Float64),
+            (DataType::Date32, DataType::Int32 | DataType::Int64) => Ok(DataType::Date32),
+            (DataType::Date32, DataType::Date32) => Ok(DataType::Int32),
+            _ => bail!("unsupported binary op {:?} on {:?} and {:?}", op, lt, rt),
+        },
+        BinOp::Mul => match (lt, rt) {
+            (DataType::Decimal { scale: s1, .. }, DataType::Decimal { scale: s2, .. }) => {
+                Ok(DataType::Decimal {
+                    precision: 38,
+                    scale: s1 + s2,
+                })
+            }
+            (DataType::Decimal { scale, .. }, DataType::Int32 | DataType::Int64)
+            | (DataType::Int32 | DataType::Int64, DataType::Decimal { scale, .. }) => {
+                Ok(DataType::Decimal {
+                    precision: 38,
+                    scale: *scale,
+                })
+            }
+            (DataType::Int64, DataType::Int32 | DataType::Int64)
+            | (DataType::Int32, DataType::Int64) => Ok(DataType::Int64),
+            (DataType::Int32, DataType::Int32) => Ok(DataType::Int32),
+            (DataType::Float64, _) | (_, DataType::Float64) => Ok(DataType::Float64),
+            _ => bail!("unsupported binary op Mul on {:?} and {:?}", lt, rt),
+        },
     }
 }
