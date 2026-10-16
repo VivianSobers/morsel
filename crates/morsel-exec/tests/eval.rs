@@ -698,3 +698,27 @@ fn decimal_comparison_rescaling_overflow() {
     let ord = compare_scalars(&a, &b).unwrap();
     assert_eq!(ord, std::cmp::Ordering::Greater);
 }
+
+#[test]
+fn compare_scalars_decimal_with_integer() {
+    let dec = Scalar::Decimal(2400, 2);
+    let int32 = Scalar::Int32(24);
+    let int64 = Scalar::Int64(25);
+
+    assert_eq!(
+        compare_scalars(&dec, &int32).unwrap(),
+        std::cmp::Ordering::Equal
+    );
+    assert_eq!(
+        compare_scalars(&int32, &dec).unwrap(),
+        std::cmp::Ordering::Equal
+    );
+    assert_eq!(
+        compare_scalars(&dec, &int64).unwrap(),
+        std::cmp::Ordering::Less
+    );
+    assert_eq!(
+        compare_scalars(&int64, &dec).unwrap(),
+        std::cmp::Ordering::Greater
+    );
+}

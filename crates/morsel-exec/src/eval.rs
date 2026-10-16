@@ -582,6 +582,10 @@ pub fn compare_scalars(a: &Scalar, b: &Scalar) -> Result<std::cmp::Ordering> {
         (Scalar::Utf8(x), Scalar::Utf8(y)) => Ok(x.cmp(y)),
         (Scalar::Bool(x), Scalar::Bool(y)) => Ok(x.cmp(y)),
         (Scalar::Decimal(v1, s1), Scalar::Decimal(v2, s2)) => compare_decimals(*v1, *s1, *v2, *s2),
+        (Scalar::Decimal(v, s), Scalar::Int32(x)) => compare_decimals(*v, *s, *x as i128, 0),
+        (Scalar::Int32(x), Scalar::Decimal(v, s)) => compare_decimals(*x as i128, 0, *v, *s),
+        (Scalar::Decimal(v, s), Scalar::Int64(x)) => compare_decimals(*v, *s, *x as i128, 0),
+        (Scalar::Int64(x), Scalar::Decimal(v, s)) => compare_decimals(*x as i128, 0, *v, *s),
         _ => bail!("cannot compare {:?} and {:?}", a, b),
     }
 }
