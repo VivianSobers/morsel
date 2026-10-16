@@ -735,3 +735,104 @@ fn batch_builder_zero_column_schema() {
     let batches = builder.finish();
     assert_eq!(batches.len(), 0);
 }
+
+#[test]
+fn test_inner_join_builds_on_smaller_left() {
+    let left_schema = Arc::new(Schema {
+        fields: vec![
+            Field {
+                name: "l_id".to_string(),
+                dtype: DataType::Int32,
+                nullable: false,
+            },
+            Field {
+                name: "l_val".to_string(),
+                dtype: DataType::Utf8,
+                nullable: false,
+            },
+        ],
+    });
+    let left_batch = Batch::new(
+        Arc::clone(&left_schema),
+        vec![
+            Arc::new(Column::from_scalars(
+                DataType::Int32,
+                &[Scalar::Int32(10), Scalar::Int32(20)],
+            )),
+            Arc::new(Column::from_scalars(
+                DataType::Utf8,
+                &[
+                    Scalar::Utf8("L10".to_string()),
+                    Scalar::Utf8("L20".to_string()),
+                ],
+            )),
+        ],
+    );
+
+    let right_schema = Arc::new(Schema {
+        fields: vec![
+            Field {
+                name: "r_id".to_string(),
+                dtype: DataType::Int32,
+                nullable: false,
+            },
+            Field {
+                name: "r_num".to_string(),
+                dtype: DataType::Int64,
+                nullable: false,
+            },
+        ],
+    });
+    let r_ids: Vec<Scalar> = (0..20)
+        .map(|i| Scalar::Int32(if i % 2 == 0 { 10 } else { 20 }))
+        .collect();
+    let r_nums: Vec<Scalar> = (0..20).map(|i| Scalar::Int64(i as i64 * 100)).collect();
+    let right_batch = Batch::new(
+        Arc::clone(&right_schema),
+        vec![
+            Arc::new(Column::from_scalars(DataType::Int32, &r_ids)),
+            Arc::new(Column::from_scalars(DataType::Int64, &r_nums)),
+        ],
+    );
+
+    let mut tables = HashMap::new();
+    tables.insert(
+        "t_left".to_string(),
+        make_table(Arc::clone(&left_schema), vec![left_batch]),
+    );
+    tables.insert(
+        "t_right".to_string(),
+        make_table(Arc::clone(&right_schema), vec![right_batch]),
+    );
+    let catalog = Catalog { tables };
+
+    let join = LogicalPlan::Join {
+        left: Box::new(LogicalPlan::Scan {
+            table: "t_left".to_string(),
+            columns: vec![0, 1],
+            table_schema: (*left_schema).clone(),
+        }),
+        right: Box::new(LogicalPlan::Scan {
+            table: "t_right".to_string(),
+            columns: vec![0, 1],
+            table_schema: (*right_schema).clone(),
+        }),
+        join_type: JoinType::Inner,
+        on: vec![(Expr::Column(0), Expr::Column(0))],
+        filter: Some(Expr::Binary {
+            op: BinOp::Lt,
+            left: Box::new(Expr::Column(3)),
+            right: Box::new(Expr::Literal(Scalar::Int64(1000))),
+        }),
+    };
+
+    let res = execute(&join, &catalog, 4).unwrap();
+    let total_rows: usize = res.iter().map(|b| b.len).sum();
+    // 20 rows in right: indices 0..9 have r_num < 1000 (i.e. 0, 100, ..., 900)
+    assert_eq!(total_rows, 10);
+    assert_eq!(res[0].columns.len(), 4);
+    assert_eq!(res[0].columns[0].dtype, DataType::Int32);
+    assert_eq!(res[0].columns[1].dtype, DataType::Utf8);
+    assert_eq!(res[0].columns[2].dtype, DataType::Int32);
+    assert_eq!(res[0].columns[3].dtype, DataType::Int64);
+}
