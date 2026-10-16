@@ -163,3 +163,18 @@ fn unsupported_type_errors() {
         err_msg
     );
 }
+
+#[test]
+fn negative_scale_decimal_errors() {
+    let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+        "neg_scale",
+        ArrowType::Decimal128(10, -2),
+        false,
+    )]);
+    let res = morsel_exec::parquet_load::convert_arrow_schema(&arrow_schema);
+    assert!(
+        res.is_err(),
+        "should error on negative scale, but got: {:?}",
+        res
+    );
+}
