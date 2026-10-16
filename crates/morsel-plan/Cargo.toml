@@ -1,0 +1,8 @@
+[package]
+name = "morsel-plan"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+morsel-core = { path = "../morsel-core" }
+anyhow = "1.0"
