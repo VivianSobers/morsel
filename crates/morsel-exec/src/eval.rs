@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 use chrono::Datelike;
 use morsel_core::{Batch, Column, ColumnData, DataType, Scalar};
-use morsel_plan::{binary_op_type, BinOp, DateField, Expr};
+use morsel_plan::{binary_op_type, unify_types, BinOp, DateField, Expr};
 use regex::Regex;
 
 fn checked_pow10(n: u8) -> Result<i128> {
@@ -258,12 +258,28 @@ pub fn eval(expr: &Expr, batch: &Batch) -> Result<Column> {
                 None
             };
 
-            let out_dtype = if let Some(first_then) = when_thens.first() {
-                first_then.dtype
-            } else if let Some(ref el) = else_col {
-                el.dtype
-            } else {
-                DataType::Int32
+            let mut out_dtype_opt: Option<DataType> = None;
+            for col in &when_thens {
+                out_dtype_opt = match out_dtype_opt {
+                    None => Some(col.dtype),
+                    Some(cur) => Some(unify_types(&cur, &col.dtype)?),
+                };
+            }
+            if let Some(ref el) = else_col {
+                out_dtype_opt = match out_dtype_opt {
+                    None => Some(el.dtype),
+                    Some(cur) => Some(unify_types(&cur, &el.dtype)?),
+                };
+            }
+            let out_dtype = out_dtype_opt.unwrap_or(DataType::Int32);
+
+            let when_thens: Vec<Column> = when_thens
+                .into_iter()
+                .map(|col| cast_column(&col, out_dtype))
+                .collect::<Result<Vec<_>>>()?;
+            let else_col = match else_col {
+                Some(col) => Some(cast_column(&col, out_dtype)?),
+                None => None,
             };
 
             let mut scalars = Vec::with_capacity(row_count);
@@ -839,6 +855,10 @@ fn eval_arithmetic(op: BinOp, left: &Column, right: &Column, len: usize) -> Resu
                     BinOp::Sub => Scalar::Date32(d - n as i32),
                     _ => bail!("unsupported op on Date32 and Int64"),
                 },
+                (Scalar::Int32(n), Scalar::Date32(d)) if op == BinOp::Add => Scalar::Date32(d + n),
+                (Scalar::Int64(n), Scalar::Date32(d)) if op == BinOp::Add => {
+                    Scalar::Date32(d + n as i32)
+                }
                 (Scalar::Date32(d1), Scalar::Date32(d2)) if op == BinOp::Sub => {
                     Scalar::Int32(d1 - d2)
                 }

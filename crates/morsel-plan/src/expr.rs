@@ -97,18 +97,60 @@ impl Expr {
             Expr::Like { .. } => Ok(DataType::Bool),
             Expr::InList { .. } => Ok(DataType::Bool),
             Expr::Case { whens, else_expr } => {
-                if let Some((_, then_expr)) = whens.first() {
-                    then_expr.data_type(input)
-                } else if let Some(else_expr) = else_expr {
-                    else_expr.data_type(input)
-                } else {
-                    bail!("case expression has no branches")
+                let mut unified: Option<DataType> = None;
+                for (_, then_expr) in whens {
+                    let dt = then_expr.data_type(input)?;
+                    unified = match unified {
+                        None => Some(dt),
+                        Some(cur) => Some(unify_types(&cur, &dt)?),
+                    };
                 }
+                if let Some(else_expr) = else_expr {
+                    let dt = else_expr.data_type(input)?;
+                    unified = match unified {
+                        None => Some(dt),
+                        Some(cur) => Some(unify_types(&cur, &dt)?),
+                    };
+                }
+                unified.ok_or_else(|| anyhow::anyhow!("case expression has no branches"))
             }
             Expr::Cast { to, .. } => Ok(*to),
             Expr::Extract { .. } => Ok(DataType::Int64),
             Expr::Substring { .. } => Ok(DataType::Utf8),
         }
+    }
+}
+
+pub fn unify_types(t1: &DataType, t2: &DataType) -> Result<DataType> {
+    if t1 == t2 {
+        return Ok(*t1);
+    }
+    match (t1, t2) {
+        (DataType::Float64, _) | (_, DataType::Float64) => Ok(DataType::Float64),
+        (
+            DataType::Decimal {
+                precision: p1,
+                scale: s1,
+            },
+            DataType::Decimal {
+                precision: p2,
+                scale: s2,
+            },
+        ) => Ok(DataType::Decimal {
+            precision: (*p1).max(*p2).max(38),
+            scale: (*s1).max(*s2),
+        }),
+        (DataType::Decimal { scale, .. }, DataType::Int32 | DataType::Int64)
+        | (DataType::Int32 | DataType::Int64, DataType::Decimal { scale, .. }) => {
+            Ok(DataType::Decimal {
+                precision: 38,
+                scale: *scale,
+            })
+        }
+        (DataType::Int64, DataType::Int32) | (DataType::Int32, DataType::Int64) => {
+            Ok(DataType::Int64)
+        }
+        _ => bail!("cannot unify types {:?} and {:?}", t1, t2),
     }
 }
 
@@ -142,7 +184,10 @@ pub fn binary_op_type(op: BinOp, lt: &DataType, rt: &DataType) -> Result<DataTyp
             (DataType::Int32, DataType::Int32) => Ok(DataType::Int32),
             (DataType::Float64, _) | (_, DataType::Float64) => Ok(DataType::Float64),
             (DataType::Date32, DataType::Int32 | DataType::Int64) => Ok(DataType::Date32),
-            (DataType::Date32, DataType::Date32) => Ok(DataType::Int32),
+            (DataType::Int32 | DataType::Int64, DataType::Date32) if op == BinOp::Add => {
+                Ok(DataType::Date32)
+            }
+            (DataType::Date32, DataType::Date32) if op == BinOp::Sub => Ok(DataType::Int32),
             _ => bail!("unsupported binary op {:?} on {:?} and {:?}", op, lt, rt),
         },
         BinOp::Mul => match (lt, rt) {
