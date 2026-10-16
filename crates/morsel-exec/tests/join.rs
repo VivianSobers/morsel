@@ -836,3 +836,448 @@ fn test_inner_join_builds_on_smaller_left() {
     assert_eq!(res[0].columns[2].dtype, DataType::Int32);
     assert_eq!(res[0].columns[3].dtype, DataType::Int64);
 }
+
+#[test]
+fn test_join_many_duplicate_keys() {
+    let left_schema = Arc::new(Schema {
+        fields: vec![
+            Field {
+                name: "l_k".to_string(),
+                dtype: DataType::Int64,
+                nullable: false,
+            },
+            Field {
+                name: "l_v".to_string(),
+                dtype: DataType::Int64,
+                nullable: false,
+            },
+        ],
+    });
+    let right_schema = Arc::new(Schema {
+        fields: vec![
+            Field {
+                name: "r_k".to_string(),
+                dtype: DataType::Int64,
+                nullable: false,
+            },
+            Field {
+                name: "r_v".to_string(),
+                dtype: DataType::Int64,
+                nullable: false,
+            },
+        ],
+    });
+
+    let n_left = 300;
+    let l_k: Vec<Scalar> = (0..n_left).map(|i| Scalar::Int64((i % 3) as i64)).collect();
+    let l_v: Vec<Scalar> = (0..n_left).map(|i| Scalar::Int64(i as i64)).collect();
+    let left_batch = Batch::new(
+        Arc::clone(&left_schema),
+        vec![
+            Arc::new(Column::from_scalars(DataType::Int64, &l_k)),
+            Arc::new(Column::from_scalars(DataType::Int64, &l_v)),
+        ],
+    );
+
+    let n_right = 1200;
+    let r_k: Vec<Scalar> = (0..n_right)
+        .map(|i| Scalar::Int64((i % 4) as i64))
+        .collect();
+    let r_v: Vec<Scalar> = (0..n_right).map(|i| Scalar::Int64(i as i64)).collect();
+    let right_batch = Batch::new(
+        Arc::clone(&right_schema),
+        vec![
+            Arc::new(Column::from_scalars(DataType::Int64, &r_k)),
+            Arc::new(Column::from_scalars(DataType::Int64, &r_v)),
+        ],
+    );
+
+    let mut tables = HashMap::new();
+    tables.insert(
+        "left_t".to_string(),
+        make_table(Arc::clone(&left_schema), vec![left_batch]),
+    );
+    tables.insert(
+        "right_t".to_string(),
+        make_table(Arc::clone(&right_schema), vec![right_batch]),
+    );
+    let catalog = Catalog { tables };
+
+    // 1. Inner join (keys 0, 1, 2 match: 100 * 300 = 30,000 rows each -> 90,000 total)
+    let inner_plan = LogicalPlan::Join {
+        left: Box::new(LogicalPlan::Scan {
+            table: "left_t".to_string(),
+            columns: vec![0, 1],
+            table_schema: (*left_schema).clone(),
+        }),
+        right: Box::new(LogicalPlan::Scan {
+            table: "right_t".to_string(),
+            columns: vec![0, 1],
+            table_schema: (*right_schema).clone(),
+        }),
+        join_type: JoinType::Inner,
+        on: vec![(Expr::Column(0), Expr::Column(0))],
+        filter: None,
+    };
+    let inner_res = execute(&inner_plan, &catalog, 4).unwrap();
+    let inner_rows: usize = inner_res.iter().map(|b| b.len).sum();
+    assert_eq!(inner_rows, 90_000);
+
+    // 2. Semi join: left is probe, right is build. All 300 left rows match.
+    let semi_plan = LogicalPlan::Join {
+        left: Box::new(LogicalPlan::Scan {
+            table: "left_t".to_string(),
+            columns: vec![0, 1],
+            table_schema: (*left_schema).clone(),
+        }),
+        right: Box::new(LogicalPlan::Scan {
+            table: "right_t".to_string(),
+            columns: vec![0, 1],
+            table_schema: (*right_schema).clone(),
+        }),
+        join_type: JoinType::Semi,
+        on: vec![(Expr::Column(0), Expr::Column(0))],
+        filter: None,
+    };
+    let semi_res = execute(&semi_plan, &catalog, 4).unwrap();
+    let semi_rows: usize = semi_res.iter().map(|b| b.len).sum();
+    assert_eq!(semi_rows, 300);
+
+    // 3. Anti join: left has keys 0, 1, 2 all in right, so 0 rows
+    let anti_plan = LogicalPlan::Join {
+        left: Box::new(LogicalPlan::Scan {
+            table: "left_t".to_string(),
+            columns: vec![0, 1],
+            table_schema: (*left_schema).clone(),
+        }),
+        right: Box::new(LogicalPlan::Scan {
+            table: "right_t".to_string(),
+            columns: vec![0, 1],
+            table_schema: (*right_schema).clone(),
+        }),
+        join_type: JoinType::Anti,
+        on: vec![(Expr::Column(0), Expr::Column(0))],
+        filter: None,
+    };
+    let anti_res = execute(&anti_plan, &catalog, 4).unwrap();
+    let anti_rows: usize = anti_res.iter().map(|b| b.len).sum();
+    assert_eq!(anti_rows, 0);
+
+    // Anti join with right as probe and left as build: key 3 has 300 rows that do not match left!
+    let anti_plan2 = LogicalPlan::Join {
+        left: Box::new(LogicalPlan::Scan {
+            table: "right_t".to_string(),
+            columns: vec![0, 1],
+            table_schema: (*right_schema).clone(),
+        }),
+        right: Box::new(LogicalPlan::Scan {
+            table: "left_t".to_string(),
+            columns: vec![0, 1],
+            table_schema: (*left_schema).clone(),
+        }),
+        join_type: JoinType::Anti,
+        on: vec![(Expr::Column(0), Expr::Column(0))],
+        filter: None,
+    };
+    let anti_res2 = execute(&anti_plan2, &catalog, 4).unwrap();
+    let anti_rows2: usize = anti_res2.iter().map(|b| b.len).sum();
+    assert_eq!(anti_rows2, 300);
+}
+
+#[test]
+fn test_join_all_null_keys() {
+    let left_schema = Arc::new(Schema {
+        fields: vec![
+            Field {
+                name: "l_k".to_string(),
+                dtype: DataType::Int32,
+                nullable: true,
+            },
+            Field {
+                name: "l_v".to_string(),
+                dtype: DataType::Utf8,
+                nullable: false,
+            },
+        ],
+    });
+    let right_schema = Arc::new(Schema {
+        fields: vec![
+            Field {
+                name: "r_k".to_string(),
+                dtype: DataType::Int32,
+                nullable: true,
+            },
+            Field {
+                name: "r_v".to_string(),
+                dtype: DataType::Utf8,
+                nullable: false,
+            },
+        ],
+    });
+
+    let n = 100;
+    let l_k = vec![Scalar::Null; n];
+    let l_v: Vec<Scalar> = (0..n).map(|i| Scalar::Utf8(format!("l{}", i))).collect();
+    let left_batch = Batch::new(
+        Arc::clone(&left_schema),
+        vec![
+            Arc::new(Column::from_scalars(DataType::Int32, &l_k)),
+            Arc::new(Column::from_scalars(DataType::Utf8, &l_v)),
+        ],
+    );
+
+    let r_k: Vec<Scalar> = (0..n)
+        .map(|i| {
+            if i % 2 == 0 {
+                Scalar::Null
+            } else {
+                Scalar::Int32(i as i32)
+            }
+        })
+        .collect();
+    let r_v: Vec<Scalar> = (0..n).map(|i| Scalar::Utf8(format!("r{}", i))).collect();
+    let right_batch = Batch::new(
+        Arc::clone(&right_schema),
+        vec![
+            Arc::new(Column::from_scalars(DataType::Int32, &r_k)),
+            Arc::new(Column::from_scalars(DataType::Utf8, &r_v)),
+        ],
+    );
+
+    let mut tables = HashMap::new();
+    tables.insert(
+        "left_t".to_string(),
+        make_table(Arc::clone(&left_schema), vec![left_batch]),
+    );
+    tables.insert(
+        "right_t".to_string(),
+        make_table(Arc::clone(&right_schema), vec![right_batch]),
+    );
+    let catalog = Catalog { tables };
+
+    // Inner: NULL never equals NULL, so 0 matches
+    let inner_plan = LogicalPlan::Join {
+        left: Box::new(LogicalPlan::Scan {
+            table: "left_t".to_string(),
+            columns: vec![0, 1],
+            table_schema: (*left_schema).clone(),
+        }),
+        right: Box::new(LogicalPlan::Scan {
+            table: "right_t".to_string(),
+            columns: vec![0, 1],
+            table_schema: (*right_schema).clone(),
+        }),
+        join_type: JoinType::Inner,
+        on: vec![(Expr::Column(0), Expr::Column(0))],
+        filter: None,
+    };
+    let inner_res = execute(&inner_plan, &catalog, 4).unwrap();
+    let inner_rows: usize = inner_res.iter().map(|b| b.len).sum();
+    assert_eq!(inner_rows, 0);
+
+    // Semi: 0 matches
+    let semi_plan = LogicalPlan::Join {
+        left: Box::new(LogicalPlan::Scan {
+            table: "left_t".to_string(),
+            columns: vec![0, 1],
+            table_schema: (*left_schema).clone(),
+        }),
+        right: Box::new(LogicalPlan::Scan {
+            table: "right_t".to_string(),
+            columns: vec![0, 1],
+            table_schema: (*right_schema).clone(),
+        }),
+        join_type: JoinType::Semi,
+        on: vec![(Expr::Column(0), Expr::Column(0))],
+        filter: None,
+    };
+    let semi_res = execute(&semi_plan, &catalog, 4).unwrap();
+    let semi_rows: usize = semi_res.iter().map(|b| b.len).sum();
+    assert_eq!(semi_rows, 0);
+
+    // Anti: all left rows don't match, so all n rows emitted
+    let anti_plan = LogicalPlan::Join {
+        left: Box::new(LogicalPlan::Scan {
+            table: "left_t".to_string(),
+            columns: vec![0, 1],
+            table_schema: (*left_schema).clone(),
+        }),
+        right: Box::new(LogicalPlan::Scan {
+            table: "right_t".to_string(),
+            columns: vec![0, 1],
+            table_schema: (*right_schema).clone(),
+        }),
+        join_type: JoinType::Anti,
+        on: vec![(Expr::Column(0), Expr::Column(0))],
+        filter: None,
+    };
+    let anti_res = execute(&anti_plan, &catalog, 4).unwrap();
+    let anti_rows: usize = anti_res.iter().map(|b| b.len).sum();
+    assert_eq!(anti_rows, n);
+
+    // Left: all left rows preserved, right columns are NULL
+    let left_join_plan = LogicalPlan::Join {
+        left: Box::new(LogicalPlan::Scan {
+            table: "left_t".to_string(),
+            columns: vec![0, 1],
+            table_schema: (*left_schema).clone(),
+        }),
+        right: Box::new(LogicalPlan::Scan {
+            table: "right_t".to_string(),
+            columns: vec![0, 1],
+            table_schema: (*right_schema).clone(),
+        }),
+        join_type: JoinType::Left,
+        on: vec![(Expr::Column(0), Expr::Column(0))],
+        filter: None,
+    };
+    let left_join_res = execute(&left_join_plan, &catalog, 4).unwrap();
+    let left_join_rows: usize = left_join_res.iter().map(|b| b.len).sum();
+    assert_eq!(left_join_rows, n);
+    for b in &left_join_res {
+        for row in 0..b.len {
+            assert_eq!(b.columns[2].get(row), Scalar::Null);
+            assert_eq!(b.columns[3].get(row), Scalar::Null);
+        }
+    }
+}
+
+#[test]
+fn test_join_empty_build_side() {
+    let left_schema = Arc::new(Schema {
+        fields: vec![
+            Field {
+                name: "l_k".to_string(),
+                dtype: DataType::Int32,
+                nullable: false,
+            },
+            Field {
+                name: "l_v".to_string(),
+                dtype: DataType::Utf8,
+                nullable: false,
+            },
+        ],
+    });
+    let right_schema = Arc::new(Schema {
+        fields: vec![
+            Field {
+                name: "r_k".to_string(),
+                dtype: DataType::Int32,
+                nullable: false,
+            },
+            Field {
+                name: "r_v".to_string(),
+                dtype: DataType::Utf8,
+                nullable: false,
+            },
+        ],
+    });
+
+    let n = 50;
+    let l_k: Vec<Scalar> = (0..n).map(|i| Scalar::Int32(i as i32)).collect();
+    let l_v: Vec<Scalar> = (0..n).map(|i| Scalar::Utf8(format!("l{}", i))).collect();
+    let left_batch = Batch::new(
+        Arc::clone(&left_schema),
+        vec![
+            Arc::new(Column::from_scalars(DataType::Int32, &l_k)),
+            Arc::new(Column::from_scalars(DataType::Utf8, &l_v)),
+        ],
+    );
+
+    let mut tables = HashMap::new();
+    tables.insert(
+        "left_t".to_string(),
+        make_table(Arc::clone(&left_schema), vec![left_batch]),
+    );
+    tables.insert(
+        "right_t".to_string(),
+        make_table(Arc::clone(&right_schema), vec![]),
+    );
+    let catalog = Catalog { tables };
+
+    // 1. Inner: empty
+    let inner_plan = LogicalPlan::Join {
+        left: Box::new(LogicalPlan::Scan {
+            table: "left_t".to_string(),
+            columns: vec![0, 1],
+            table_schema: (*left_schema).clone(),
+        }),
+        right: Box::new(LogicalPlan::Scan {
+            table: "right_t".to_string(),
+            columns: vec![0, 1],
+            table_schema: (*right_schema).clone(),
+        }),
+        join_type: JoinType::Inner,
+        on: vec![(Expr::Column(0), Expr::Column(0))],
+        filter: None,
+    };
+    let inner_res = execute(&inner_plan, &catalog, 4).unwrap();
+    let inner_rows: usize = inner_res.iter().map(|b| b.len).sum();
+    assert_eq!(inner_rows, 0);
+
+    // 2. Semi: empty
+    let semi_plan = LogicalPlan::Join {
+        left: Box::new(LogicalPlan::Scan {
+            table: "left_t".to_string(),
+            columns: vec![0, 1],
+            table_schema: (*left_schema).clone(),
+        }),
+        right: Box::new(LogicalPlan::Scan {
+            table: "right_t".to_string(),
+            columns: vec![0, 1],
+            table_schema: (*right_schema).clone(),
+        }),
+        join_type: JoinType::Semi,
+        on: vec![(Expr::Column(0), Expr::Column(0))],
+        filter: None,
+    };
+    let semi_res = execute(&semi_plan, &catalog, 4).unwrap();
+    let semi_rows: usize = semi_res.iter().map(|b| b.len).sum();
+    assert_eq!(semi_rows, 0);
+
+    // 3. Anti: all n rows
+    let anti_plan = LogicalPlan::Join {
+        left: Box::new(LogicalPlan::Scan {
+            table: "left_t".to_string(),
+            columns: vec![0, 1],
+            table_schema: (*left_schema).clone(),
+        }),
+        right: Box::new(LogicalPlan::Scan {
+            table: "right_t".to_string(),
+            columns: vec![0, 1],
+            table_schema: (*right_schema).clone(),
+        }),
+        join_type: JoinType::Anti,
+        on: vec![(Expr::Column(0), Expr::Column(0))],
+        filter: None,
+    };
+    let anti_res = execute(&anti_plan, &catalog, 4).unwrap();
+    let anti_rows: usize = anti_res.iter().map(|b| b.len).sum();
+    assert_eq!(anti_rows, n);
+
+    // 4. Left: all n rows, right columns NULL
+    let left_join_plan = LogicalPlan::Join {
+        left: Box::new(LogicalPlan::Scan {
+            table: "left_t".to_string(),
+            columns: vec![0, 1],
+            table_schema: (*left_schema).clone(),
+        }),
+        right: Box::new(LogicalPlan::Scan {
+            table: "right_t".to_string(),
+            columns: vec![0, 1],
+            table_schema: (*right_schema).clone(),
+        }),
+        join_type: JoinType::Left,
+        on: vec![(Expr::Column(0), Expr::Column(0))],
+        filter: None,
+    };
+    let left_join_res = execute(&left_join_plan, &catalog, 4).unwrap();
+    let left_join_rows: usize = left_join_res.iter().map(|b| b.len).sum();
+    assert_eq!(left_join_rows, n);
+    for b in &left_join_res {
+        for row in 0..b.len {
+            assert_eq!(b.columns[2].get(row), Scalar::Null);
+            assert_eq!(b.columns[3].get(row), Scalar::Null);
+        }
+    }
+}

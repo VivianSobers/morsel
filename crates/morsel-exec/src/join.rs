@@ -1,3 +1,4 @@
+use std::hash::Hash;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -56,6 +57,87 @@ pub struct RowLoc {
     pub batch_idx: u32,
     pub row_idx: u32,
 }
+
+#[derive(Clone, Copy, Debug)]
+struct HeadTail {
+    head: u32,
+    tail: u32,
+}
+
+pub struct PartitionTable {
+    map: AHashMap<JoinKey, HeadTail>,
+    locs: Vec<RowLoc>,
+    next: Vec<u32>,
+}
+
+impl PartitionTable {
+    pub fn new() -> Self {
+        Self {
+            map: AHashMap::new(),
+            locs: Vec::new(),
+            next: Vec::new(),
+        }
+    }
+
+    #[inline]
+    pub fn get_matches(&self, key: &JoinKey) -> Option<MatchesIter<'_>> {
+        self.map.get(key).map(|ht| MatchesIter {
+            locs: &self.locs,
+            next: &self.next,
+            cur: ht.head,
+        })
+    }
+}
+
+impl Default for PartitionTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct MatchesIter<'a> {
+    locs: &'a [RowLoc],
+    next: &'a [u32],
+    cur: u32,
+}
+
+impl<'a> Iterator for MatchesIter<'a> {
+    type Item = RowLoc;
+
+    #[inline]
+    fn next(&mut self) -> Option<RowLoc> {
+        if self.cur == u32::MAX {
+            None
+        } else {
+            let idx = self.cur as usize;
+            let loc = self.locs[idx];
+            self.cur = self.next[idx];
+            Some(loc)
+        }
+    }
+}
+
+pub struct ParallelJoinTable {
+    partitions: Vec<PartitionTable>,
+    mask: usize,
+    random_state: ahash::RandomState,
+}
+
+impl ParallelJoinTable {
+    #[inline]
+    fn partition_index(&self, key: &JoinKey) -> usize {
+        (self.random_state.hash_one(key) as usize) & self.mask
+    }
+
+    #[inline]
+    pub fn get_matches(&self, key: &JoinKey) -> Option<MatchesIter<'_>> {
+        let p = self.partition_index(key);
+        self.partitions[p].get_matches(key)
+    }
+}
+
+type PartitionInputBuffers = Vec<Mutex<Option<Vec<Vec<(JoinKey, RowLoc)>>>>>;
 
 pub struct BatchBuilder {
     schema: Arc<Schema>,
@@ -314,73 +396,224 @@ pub fn execute_join(
     let right_total_rows: usize = right_batches.iter().map(|b| b.len).sum();
     let build_on_left = matches!(join_type, JoinType::Inner) && left_total_rows < right_total_rows;
 
-    // Materialize build side hash table
-    let mut hash_table: AHashMap<JoinKey, Vec<RowLoc>> = AHashMap::new();
-    if build_on_left {
-        for (b_idx, l_batch) in left_batches.iter().enumerate() {
-            let l_key_cols: Vec<Column> = on
-                .iter()
-                .enumerate()
-                .map(|(k, (l_expr, _))| {
-                    let col = eval(l_expr, l_batch)?;
-                    if col.dtype != key_types[k] {
-                        cast_column(&col, key_types[k])
-                    } else {
-                        Ok(col)
-                    }
-                })
-                .collect::<Result<Vec<_>>>()?;
-
-            for l_idx in 0..l_batch.len {
-                if let Some(key) = extract_join_key(&l_key_cols, l_idx) {
-                    hash_table.entry(key).or_default().push(RowLoc {
-                        batch_idx: b_idx as u32,
-                        row_idx: l_idx as u32,
-                    });
-                }
-            }
-        }
+    let (build_batches, build_total_rows) = if build_on_left {
+        (&left_batches, left_total_rows)
     } else {
-        for (b_idx, r_batch) in right_batches.iter().enumerate() {
-            let filter_mask = if let Some(ref rf) = right_filter {
-                let sel = eval_predicate(rf, r_batch)?;
-                let mut mask = vec![false; r_batch.len];
-                for idx in sel {
-                    mask[idx as usize] = true;
-                }
-                Some(mask)
-            } else {
-                None
-            };
+        (&right_batches, right_total_rows)
+    };
 
-            let r_key_cols: Vec<Column> = on
-                .iter()
-                .enumerate()
-                .map(|(k, (_, r_expr))| {
-                    let col = eval(r_expr, r_batch)?;
-                    if col.dtype != key_types[k] {
-                        cast_column(&col, key_types[k])
+    let num_threads = threads.max(1);
+    let num_partitions = if build_total_rows < 512 {
+        1
+    } else {
+        (num_threads * 4).next_power_of_two().clamp(16, 64)
+    };
+    let mask = num_partitions - 1;
+    let random_state = ahash::RandomState::new();
+
+    let mut partitions = Vec::with_capacity(num_partitions);
+    for _ in 0..num_partitions {
+        partitions.push(PartitionTable::new());
+    }
+
+    if build_total_rows > 0 {
+        let num_batches = build_batches.len();
+        let chunk_size = 16.max((num_batches / (num_threads * 4)).max(1));
+        let next_chunk = AtomicUsize::new(0);
+        let cancelled = AtomicBool::new(false);
+        let error_cell = Mutex::new(None);
+
+        // Phase 1: Partition build rows in parallel
+        let mut thread_buffers: Vec<Vec<Vec<(JoinKey, RowLoc)>>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..num_threads)
+                .map(|_| {
+                    let next_chunk_ref = &next_chunk;
+                    let cancelled_ref = &cancelled;
+                    let err_cell = &error_cell;
+                    let b_batches = build_batches.as_slice();
+                    let k_types = &key_types;
+                    let r_state = &random_state;
+                    let r_filt = if build_on_left {
+                        None
                     } else {
-                        Ok(col)
-                    }
-                })
-                .collect::<Result<Vec<_>>>()?;
+                        right_filter.as_ref()
+                    };
 
-            for r_idx in 0..r_batch.len {
-                if let Some(ref mask) = filter_mask {
-                    if !mask[r_idx] {
-                        continue;
-                    }
-                }
-                if let Some(key) = extract_join_key(&r_key_cols, r_idx) {
-                    hash_table.entry(key).or_default().push(RowLoc {
-                        batch_idx: b_idx as u32,
-                        row_idx: r_idx as u32,
-                    });
+                    s.spawn(move || {
+                        let mut t_buf: Vec<Vec<(JoinKey, RowLoc)>> =
+                            (0..num_partitions).map(|_| Vec::new()).collect();
+                        loop {
+                            if cancelled_ref.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            let chunk_start =
+                                next_chunk_ref.fetch_add(chunk_size, Ordering::Relaxed);
+                            if chunk_start >= num_batches {
+                                break;
+                            }
+                            let chunk_end = (chunk_start + chunk_size).min(num_batches);
+
+                            for (offset, batch) in
+                                b_batches[chunk_start..chunk_end].iter().enumerate()
+                            {
+                                let b_idx = chunk_start + offset;
+                                let filter_mask = if let Some(rf) = r_filt {
+                                    match eval_predicate(rf, batch) {
+                                        Ok(sel) => {
+                                            let mut mask = vec![false; batch.len];
+                                            for idx in sel {
+                                                mask[idx as usize] = true;
+                                            }
+                                            Some(mask)
+                                        }
+                                        Err(e) => {
+                                            let mut l = err_cell.lock().unwrap();
+                                            if l.is_none() {
+                                                *l = Some(e);
+                                            }
+                                            cancelled_ref.store(true, Ordering::Relaxed);
+                                            return t_buf;
+                                        }
+                                    }
+                                } else {
+                                    None
+                                };
+
+                                let key_cols = match on
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(k, (expr_l, expr_r))| {
+                                        let expr = if build_on_left { expr_l } else { expr_r };
+                                        let col = eval(expr, batch)?;
+                                        if col.dtype != k_types[k] {
+                                            cast_column(&col, k_types[k])
+                                        } else {
+                                            Ok(col)
+                                        }
+                                    })
+                                    .collect::<Result<Vec<_>>>()
+                                {
+                                    Ok(cols) => cols,
+                                    Err(e) => {
+                                        let mut l = err_cell.lock().unwrap();
+                                        if l.is_none() {
+                                            *l = Some(e);
+                                        }
+                                        cancelled_ref.store(true, Ordering::Relaxed);
+                                        return t_buf;
+                                    }
+                                };
+
+                                for row_idx in 0..batch.len {
+                                    if let Some(ref mask) = filter_mask {
+                                        if !mask[row_idx] {
+                                            continue;
+                                        }
+                                    }
+                                    if let Some(key) = extract_join_key(&key_cols, row_idx) {
+                                        let p = (r_state.hash_one(&key) as usize) & mask;
+                                        t_buf[p].push((
+                                            key,
+                                            RowLoc {
+                                                batch_idx: b_idx as u32,
+                                                row_idx: row_idx as u32,
+                                            },
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        t_buf
+                    })
+                })
+                .collect();
+
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        if let Some(err) = error_cell.into_inner().unwrap() {
+            return Err(err);
+        }
+
+        // Phase 2: Build partition tables in parallel
+        let partition_inputs: PartitionInputBuffers = (0..num_partitions)
+            .map(|p| {
+                let bufs: Vec<_> = (0..num_threads)
+                    .map(|t| std::mem::take(&mut thread_buffers[t][p]))
+                    .collect();
+                Mutex::new(Some(bufs))
+            })
+            .collect();
+
+        let next_partition = AtomicUsize::new(0);
+        let mut partition_tables: Vec<Option<PartitionTable>> =
+            (0..num_partitions).map(|_| None).collect();
+
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (0..num_threads)
+                .map(|_| {
+                    let next_p_ref = &next_partition;
+                    let p_inputs = &partition_inputs;
+                    s.spawn(move || {
+                        let mut built = Vec::new();
+                        loop {
+                            let p = next_p_ref.fetch_add(1, Ordering::Relaxed);
+                            if p >= num_partitions {
+                                break;
+                            }
+                            let bufs = p_inputs[p].lock().unwrap().take().unwrap();
+                            let total_entries: usize = bufs.iter().map(|b| b.len()).sum();
+                            let mut map = AHashMap::with_capacity(total_entries);
+                            let mut locs = Vec::with_capacity(total_entries);
+                            let mut next = Vec::with_capacity(total_entries);
+
+                            for thread_buf in bufs {
+                                for (key, loc) in thread_buf {
+                                    let entry_idx = locs.len() as u32;
+                                    locs.push(loc);
+                                    next.push(u32::MAX);
+
+                                    match map.entry(key) {
+                                        std::collections::hash_map::Entry::Occupied(mut occ) => {
+                                            let ht: &mut HeadTail = occ.get_mut();
+                                            next[ht.tail as usize] = entry_idx;
+                                            ht.tail = entry_idx;
+                                        }
+                                        std::collections::hash_map::Entry::Vacant(vac) => {
+                                            vac.insert(HeadTail {
+                                                head: entry_idx,
+                                                tail: entry_idx,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            built.push((p, PartitionTable { map, locs, next }));
+                        }
+                        built
+                    })
+                })
+                .collect();
+
+            for h in handles {
+                let res = h.join().unwrap();
+                for (p, table) in res {
+                    partition_tables[p] = Some(table);
                 }
             }
-        }
+        });
+
+        partitions = partition_tables
+            .into_iter()
+            .map(|opt| opt.unwrap_or_else(PartitionTable::new))
+            .collect();
     }
+
+    let hash_table = ParallelJoinTable {
+        partitions,
+        mask,
+        random_state,
+    };
 
     let probe_batches = if build_on_left {
         &right_batches
@@ -486,14 +719,13 @@ pub fn execute_join(
                                     continue;
                                 }
                             }
-                            let locs: Option<&Vec<RowLoc>> =
-                                match extract_join_key(&r_key_cols, r_idx) {
-                                    Some(ref key) => ht.get(key),
-                                    None => None,
-                                };
+                            let locs = match extract_join_key(&r_key_cols, r_idx) {
+                                Some(ref key) => ht.get_matches(key),
+                                None => None,
+                            };
 
                             if let Some(matched_locs) = locs {
-                                for &loc in matched_locs {
+                                for loc in matched_locs {
                                     let l_batch = &l_batches[loc.batch_idx as usize];
                                     let l_idx = loc.row_idx as usize;
                                     if let Some(f) = filter {
@@ -560,16 +792,15 @@ pub fn execute_join(
                         };
 
                         for l_idx in 0..l_batch.len {
-                            let locs: Option<&Vec<RowLoc>> =
-                                match extract_join_key(&l_key_cols, l_idx) {
-                                    Some(ref key) => ht.get(key),
-                                    None => None,
-                                };
+                            let locs = match extract_join_key(&l_key_cols, l_idx) {
+                                Some(ref key) => ht.get_matches(key),
+                                None => None,
+                            };
 
                             match join_type {
                                 JoinType::Inner => {
                                     if let Some(matched_locs) = locs {
-                                        for &loc in matched_locs {
+                                        for loc in matched_locs {
                                             if let Some(f) = filter {
                                                 match test_filter_pair(
                                                     f, l_batch, l_idx, r_batches, loc, comb_sch,
@@ -603,7 +834,7 @@ pub fn execute_join(
                                 JoinType::Left => {
                                     let mut matched = false;
                                     if let Some(matched_locs) = locs {
-                                        for &loc in matched_locs {
+                                        for loc in matched_locs {
                                             if let Some(f) = filter {
                                                 match test_filter_pair(
                                                     f, l_batch, l_idx, r_batches, loc, comb_sch,
@@ -646,7 +877,7 @@ pub fn execute_join(
                                     let mut matched = false;
                                     if let Some(matched_locs) = locs {
                                         if let Some(f) = filter {
-                                            for &loc in matched_locs {
+                                            for loc in matched_locs {
                                                 match test_filter_pair(
                                                     f, l_batch, l_idx, r_batches, loc, comb_sch,
                                                     ref_cols,
@@ -668,7 +899,7 @@ pub fn execute_join(
                                                     }
                                                 }
                                             }
-                                        } else if !matched_locs.is_empty() {
+                                        } else {
                                             matched = true;
                                         }
                                     }
@@ -682,7 +913,7 @@ pub fn execute_join(
                                     let mut has_matching_right = false;
                                     if let Some(matched_locs) = locs {
                                         if let Some(f) = filter {
-                                            for &loc in matched_locs {
+                                            for loc in matched_locs {
                                                 match test_filter_pair(
                                                     f, l_batch, l_idx, r_batches, loc, comb_sch,
                                                     ref_cols,
@@ -704,7 +935,7 @@ pub fn execute_join(
                                                     }
                                                 }
                                             }
-                                        } else if !matched_locs.is_empty() {
+                                        } else {
                                             has_matching_right = true;
                                         }
                                     }
