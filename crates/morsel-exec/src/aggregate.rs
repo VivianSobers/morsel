@@ -547,23 +547,10 @@ pub fn execute_aggregate(
         return Ok(Vec::new());
     }
 
-    // Sort keys for deterministic output
-    let mut entries: Vec<(Vec<ScalarKey>, Vec<AggState>)> = merged_map
+    let entries: Vec<(Vec<ScalarKey>, Vec<AggState>)> = merged_map
         .into_iter()
         .map(|(k, s)| (k.to_vec(), s))
         .collect();
-    // Deterministic sort:
-    entries.sort_by(|a, b| {
-        for (ka, kb) in a.0.iter().zip(b.0.iter()) {
-            let sa = to_scalar(ka);
-            let sb = to_scalar(kb);
-            let ord = compare_scalars(&sa, &sb).unwrap_or(std::cmp::Ordering::Equal);
-            if ord != std::cmp::Ordering::Equal {
-                return ord;
-            }
-        }
-        std::cmp::Ordering::Equal
-    });
 
     let total_rows = entries.len();
     let num_group_cols = group_by.len();
