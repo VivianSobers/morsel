@@ -627,3 +627,102 @@ fn join_threads_do_not_change_result() {
     assert_eq!(to_vec(&res1), to_vec(&res3));
     assert_eq!(to_vec(&res1), to_vec(&res16));
 }
+
+#[test]
+fn join_keys_differing_types_and_scales() {
+    let left_schema = Arc::new(Schema {
+        fields: vec![
+            Field {
+                name: "l_int".to_string(),
+                dtype: DataType::Int32,
+                nullable: false,
+            },
+            Field {
+                name: "l_dec".to_string(),
+                dtype: DataType::Decimal {
+                    precision: 15,
+                    scale: 2,
+                },
+                nullable: false,
+            },
+        ],
+    });
+    let left_batch = Batch::new(
+        Arc::clone(&left_schema),
+        vec![
+            Arc::new(Column::from_scalars(DataType::Int32, &[Scalar::Int32(42)])),
+            Arc::new(Column::from_scalars(
+                DataType::Decimal {
+                    precision: 15,
+                    scale: 2,
+                },
+                &[Scalar::Decimal(150, 2)],
+            )),
+        ],
+    );
+
+    let right_schema = Arc::new(Schema {
+        fields: vec![
+            Field {
+                name: "r_int".to_string(),
+                dtype: DataType::Int64,
+                nullable: false,
+            },
+            Field {
+                name: "r_dec".to_string(),
+                dtype: DataType::Decimal {
+                    precision: 15,
+                    scale: 4,
+                },
+                nullable: false,
+            },
+        ],
+    });
+    let right_batch = Batch::new(
+        Arc::clone(&right_schema),
+        vec![
+            Arc::new(Column::from_scalars(DataType::Int64, &[Scalar::Int64(42)])),
+            Arc::new(Column::from_scalars(
+                DataType::Decimal {
+                    precision: 15,
+                    scale: 4,
+                },
+                &[Scalar::Decimal(15000, 4)],
+            )),
+        ],
+    );
+
+    let mut tables = HashMap::new();
+    tables.insert(
+        "left_t".to_string(),
+        make_table(Arc::clone(&left_schema), vec![left_batch]),
+    );
+    tables.insert(
+        "right_t".to_string(),
+        make_table(Arc::clone(&right_schema), vec![right_batch]),
+    );
+    let catalog = Catalog { tables };
+
+    let join = LogicalPlan::Join {
+        left: Box::new(LogicalPlan::Scan {
+            table: "left_t".to_string(),
+            columns: vec![0, 1],
+            table_schema: (*left_schema).clone(),
+        }),
+        right: Box::new(LogicalPlan::Scan {
+            table: "right_t".to_string(),
+            columns: vec![0, 1],
+            table_schema: (*right_schema).clone(),
+        }),
+        join_type: JoinType::Inner,
+        on: vec![
+            (Expr::Column(0), Expr::Column(0)),
+            (Expr::Column(1), Expr::Column(1)),
+        ],
+        filter: None,
+    };
+
+    let res = execute(&join, &catalog, 1).unwrap();
+    let total_rows: usize = res.iter().map(|b| b.len).sum();
+    assert_eq!(total_rows, 1);
+}

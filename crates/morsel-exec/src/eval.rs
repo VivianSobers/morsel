@@ -334,7 +334,10 @@ pub fn eval(expr: &Expr, batch: &Batch) -> Result<Column> {
     }
 }
 
-fn cast_column(col: &Column, to: DataType) -> Result<Column> {
+pub fn cast_column(col: &Column, to: DataType) -> Result<Column> {
+    if col.dtype == to {
+        return Ok(col.clone());
+    }
     let len = col.len();
     let mut scalars = Vec::with_capacity(len);
     for i in 0..len {
