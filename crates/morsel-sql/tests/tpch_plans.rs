@@ -529,3 +529,62 @@ fn filters_pushed_to_scans_in_q3() {
         optimized
     );
 }
+
+fn is_base_scan(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Scan { .. } => true,
+        LogicalPlan::Filter { input, .. } => is_base_scan(input),
+        LogicalPlan::Project { input, .. } => is_base_scan(input),
+        _ => false,
+    }
+}
+
+fn assert_no_base_cross_join(plan: &LogicalPlan, q: usize) {
+    match plan {
+        LogicalPlan::CrossJoin { left, right } => {
+            assert!(
+                !(is_base_scan(left) && is_base_scan(right)),
+                "Q{:02} contains CrossJoin with base-table Scan on both sides:\nleft: {:#?}\nright: {:#?}",
+                q,
+                left,
+                right
+            );
+            assert_no_base_cross_join(left, q);
+            assert_no_base_cross_join(right, q);
+        }
+        LogicalPlan::Scan { .. } => {}
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Project { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Limit { input, .. } => {
+            assert_no_base_cross_join(input, q);
+        }
+        LogicalPlan::Join { left, right, .. } => {
+            assert_no_base_cross_join(left, q);
+            assert_no_base_cross_join(right, q);
+        }
+    }
+}
+
+#[test]
+fn no_cross_join_has_base_scans_on_both_sides() {
+    let catalog = tpch_schemas();
+    let stats = tpch_stats();
+    let root = repo_root();
+
+    for q in 1..=22 {
+        if q == 19 {
+            // Q19 join predicate is nested inside OR branches, resolved in Task B10
+            continue;
+        }
+        let sql_path = root.join("queries/tpch").join(format!("q{:02}.sql", q));
+        let sql = fs::read_to_string(&sql_path)
+            .unwrap_or_else(|e| panic!("failed to read {:?}: {}", sql_path, e));
+        let plan =
+            plan_sql(&sql, &catalog).unwrap_or_else(|e| panic!("failed to plan Q{:02}: {}", q, e));
+        let optimized = optimize(plan, &stats)
+            .unwrap_or_else(|e| panic!("failed to optimize Q{:02}: {}", q, e));
+        assert_no_base_cross_join(&optimized, q);
+    }
+}
