@@ -1,10 +1,9 @@
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use ahash::AHashSet;
+use ahash::{AHashMap, AHashSet};
 use anyhow::{bail, Result};
-use morsel_core::{Batch, Column, DataType, Scalar, BATCH_ROWS};
+use morsel_core::{Batch, Column, ColumnData, DataType, Scalar, BATCH_ROWS};
 use morsel_plan::{AggExpr, AggFunc, Expr, LogicalPlan};
 
 use crate::catalog::Catalog;
@@ -26,6 +25,72 @@ pub enum ScalarKey {
     Decimal(i128, u8),
     Date32(i32),
     Utf8(String),
+}
+
+pub fn column_get_key(col: &Column, i: usize) -> ScalarKey {
+    if col.is_null(i) {
+        return ScalarKey::Null;
+    }
+    match &col.data {
+        ColumnData::Bool(v) => ScalarKey::Bool(v[i]),
+        ColumnData::Int32(v) => ScalarKey::Int32(v[i]),
+        ColumnData::Int64(v) => ScalarKey::Int64(v[i]),
+        ColumnData::Float64(v) => {
+            let val = if v[i] == 0.0 { 0.0 } else { v[i] };
+            ScalarKey::Float64(val.to_bits())
+        }
+        ColumnData::Decimal(v) => {
+            if let DataType::Decimal { scale, .. } = col.dtype {
+                ScalarKey::Decimal(v[i], scale)
+            } else {
+                ScalarKey::Decimal(v[i], 0)
+            }
+        }
+        ColumnData::Date32(v) => ScalarKey::Date32(v[i]),
+        ColumnData::Utf8 { offsets, bytes } => {
+            let start = offsets[i] as usize;
+            let end = offsets[i + 1] as usize;
+            let s = std::str::from_utf8(&bytes[start..end]).unwrap();
+            ScalarKey::Utf8(s.to_string())
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum GroupKey {
+    Empty,
+    One(ScalarKey),
+    Two(ScalarKey, ScalarKey),
+    Many(Vec<ScalarKey>),
+}
+
+impl GroupKey {
+    pub fn from_cols(group_cols: &[Column], row_idx: usize) -> Self {
+        match group_cols.len() {
+            0 => GroupKey::Empty,
+            1 => GroupKey::One(column_get_key(&group_cols[0], row_idx)),
+            2 => GroupKey::Two(
+                column_get_key(&group_cols[0], row_idx),
+                column_get_key(&group_cols[1], row_idx),
+            ),
+            _ => {
+                let v = group_cols
+                    .iter()
+                    .map(|c| column_get_key(c, row_idx))
+                    .collect();
+                GroupKey::Many(v)
+            }
+        }
+    }
+
+    pub fn to_vec(&self) -> Vec<ScalarKey> {
+        match self {
+            GroupKey::Empty => Vec::new(),
+            GroupKey::One(k) => vec![k.clone()],
+            GroupKey::Two(k1, k2) => vec![k1.clone(), k2.clone()],
+            GroupKey::Many(v) => v.clone(),
+        }
+    }
 }
 
 pub fn to_key(s: &Scalar) -> ScalarKey {
@@ -171,6 +236,64 @@ impl AggState {
         Ok(())
     }
 
+    pub fn update_col(
+        &mut self,
+        func: AggFunc,
+        col: Option<&Column>,
+        row_idx: usize,
+    ) -> Result<()> {
+        self.count_star += 1;
+        if let Some(col) = col {
+            if !col.is_null(row_idx) {
+                self.count += 1;
+                if let Some(ref mut set) = self.distinct_set {
+                    set.insert(column_get_key(col, row_idx));
+                }
+                match func {
+                    AggFunc::Sum | AggFunc::Avg => match &col.data {
+                        ColumnData::Int32(v) => {
+                            self.sum_int += v[row_idx] as i64;
+                            self.has_sum = true;
+                        }
+                        ColumnData::Int64(v) => {
+                            self.sum_int += v[row_idx];
+                            self.has_sum = true;
+                        }
+                        ColumnData::Decimal(v) => {
+                            self.sum_dec += v[row_idx];
+                            self.has_sum = true;
+                        }
+                        ColumnData::Float64(v) => {
+                            self.sum_float += v[row_idx];
+                            self.has_sum = true;
+                        }
+                        other => bail!("unsupported sum/avg type: {:?}", other),
+                    },
+                    AggFunc::Min => {
+                        let scalar = col.get(row_idx);
+                        if self.min.is_none()
+                            || compare_scalars(&scalar, self.min.as_ref().unwrap())?
+                                == std::cmp::Ordering::Less
+                        {
+                            self.min = Some(scalar);
+                        }
+                    }
+                    AggFunc::Max => {
+                        let scalar = col.get(row_idx);
+                        if self.max.is_none()
+                            || compare_scalars(&scalar, self.max.as_ref().unwrap())?
+                                == std::cmp::Ordering::Greater
+                        {
+                            self.max = Some(scalar);
+                        }
+                    }
+                    AggFunc::Count | AggFunc::CountStar | AggFunc::CountDistinct => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn merge(&mut self, other: AggState) {
         self.count += other.count;
         self.count_star += other.count_star;
@@ -296,7 +419,7 @@ pub fn execute_aggregate(
                 let arg_types = &agg_arg_types;
 
                 s.spawn(move || {
-                    let mut local_map: HashMap<Vec<ScalarKey>, Vec<AggState>> = HashMap::new();
+                    let mut local_map: AHashMap<GroupKey, Vec<AggState>> = AHashMap::new();
                     loop {
                         if cancelled_ref.load(Ordering::Relaxed) {
                             break;
@@ -343,8 +466,7 @@ pub fn execute_aggregate(
                             };
 
                             for row_idx in 0..batch.len {
-                                let key: Vec<ScalarKey> =
-                                    group_cols.iter().map(|c| to_key(&c.get(row_idx))).collect();
+                                let key = GroupKey::from_cols(&group_cols, row_idx);
 
                                 let states = local_map.entry(key).or_insert_with(|| {
                                     aggs.iter()
@@ -356,8 +478,11 @@ pub fn execute_aggregate(
                                 });
 
                                 for (agg_idx, (agg, _)) in aggs.iter().enumerate() {
-                                    let val = agg_cols[agg_idx].as_ref().map(|c| c.get(row_idx));
-                                    if let Err(e) = states[agg_idx].update(agg.func, val) {
+                                    if let Err(e) = states[agg_idx].update_col(
+                                        agg.func,
+                                        agg_cols[agg_idx].as_ref(),
+                                        row_idx,
+                                    ) {
                                         let mut locked_err = err_cell.lock().unwrap();
                                         if locked_err.is_none() {
                                             *locked_err = Some(e);
@@ -382,7 +507,7 @@ pub fn execute_aggregate(
     if let Some(err) = error_cell.into_inner().unwrap() {
         return Err(err);
     }
-    let mut merged_map: HashMap<Vec<ScalarKey>, Vec<AggState>> = HashMap::new();
+    let mut merged_map: AHashMap<GroupKey, Vec<AggState>> = AHashMap::new();
 
     for map in maps {
         for (key, states) in map {
@@ -407,7 +532,7 @@ pub fn execute_aggregate(
             .enumerate()
             .map(|(idx, (agg, _))| AggState::new(agg.func, agg_arg_types[idx]))
             .collect();
-        merged_map.insert(Vec::new(), default_states);
+        merged_map.insert(GroupKey::Empty, default_states);
     }
 
     // Build output batches
@@ -423,7 +548,10 @@ pub fn execute_aggregate(
     }
 
     // Sort keys for deterministic output
-    let mut entries: Vec<(Vec<ScalarKey>, Vec<AggState>)> = merged_map.into_iter().collect();
+    let mut entries: Vec<(Vec<ScalarKey>, Vec<AggState>)> = merged_map
+        .into_iter()
+        .map(|(k, s)| (k.to_vec(), s))
+        .collect();
     // Deterministic sort:
     entries.sort_by(|a, b| {
         for (ka, kb) in a.0.iter().zip(b.0.iter()) {

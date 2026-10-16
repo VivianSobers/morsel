@@ -1,16 +1,55 @@
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use ahash::AHashMap;
 use anyhow::Result;
 use morsel_core::{Batch, Column, Scalar, Schema, BATCH_ROWS};
 use morsel_plan::{Expr, JoinType, LogicalPlan};
 
-use crate::aggregate::{to_key, ScalarKey};
+use crate::aggregate::{column_get_key, ScalarKey};
 use crate::catalog::Catalog;
 use crate::eval::{eval, eval_predicate};
 use crate::execute::execute;
 use crate::scheduler::create_morsels;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum JoinKey {
+    Single(ScalarKey),
+    Two(ScalarKey, ScalarKey),
+    Multi(Vec<ScalarKey>),
+}
+
+pub fn extract_join_key(cols: &[Column], row_idx: usize) -> Option<JoinKey> {
+    match cols.len() {
+        1 => {
+            if cols[0].is_null(row_idx) {
+                None
+            } else {
+                Some(JoinKey::Single(column_get_key(&cols[0], row_idx)))
+            }
+        }
+        2 => {
+            if cols[0].is_null(row_idx) || cols[1].is_null(row_idx) {
+                None
+            } else {
+                Some(JoinKey::Two(
+                    column_get_key(&cols[0], row_idx),
+                    column_get_key(&cols[1], row_idx),
+                ))
+            }
+        }
+        _ => {
+            let mut v = Vec::with_capacity(cols.len());
+            for col in cols {
+                if col.is_null(row_idx) {
+                    return None;
+                }
+                v.push(column_get_key(col, row_idx));
+            }
+            Some(JoinKey::Multi(v))
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct RowLoc {
@@ -129,7 +168,7 @@ pub fn execute_join(
     });
 
     // Materialize build side hash table
-    let mut hash_table: HashMap<Vec<ScalarKey>, Vec<RowLoc>> = HashMap::new();
+    let mut hash_table: AHashMap<JoinKey, Vec<RowLoc>> = AHashMap::new();
     for (b_idx, r_batch) in right_batches.iter().enumerate() {
         let r_key_cols: Vec<Column> = on
             .iter()
@@ -137,16 +176,7 @@ pub fn execute_join(
             .collect::<Result<Vec<_>>>()?;
 
         for r_idx in 0..r_batch.len {
-            let mut has_null = false;
-            let mut key = Vec::with_capacity(r_key_cols.len());
-            for col in &r_key_cols {
-                if col.is_null(r_idx) {
-                    has_null = true;
-                    break;
-                }
-                key.push(to_key(&col.get(r_idx)));
-            }
-            if !has_null {
+            if let Some(key) = extract_join_key(&r_key_cols, r_idx) {
                 hash_table.entry(key).or_default().push(RowLoc {
                     batch_idx: b_idx as u32,
                     row_idx: r_idx as u32,
@@ -212,17 +242,11 @@ pub fn execute_join(
                     };
 
                     for l_idx in 0..l_batch.len {
-                        let mut has_null = false;
-                        let mut key = Vec::with_capacity(l_key_cols.len());
-                        for col in &l_key_cols {
-                            if col.is_null(l_idx) {
-                                has_null = true;
-                                break;
-                            }
-                            key.push(to_key(&col.get(l_idx)));
-                        }
-
-                        let locs: Option<&Vec<RowLoc>> = if has_null { None } else { ht.get(&key) };
+                        let locs: Option<&Vec<RowLoc>> = match extract_join_key(&l_key_cols, l_idx)
+                        {
+                            Some(ref key) => ht.get(key),
+                            None => None,
+                        };
 
                         match join_type {
                             JoinType::Inner => {
