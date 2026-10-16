@@ -98,16 +98,17 @@ Tracks emitted row count across batches and truncates early, halting upstream mo
 
 ## 7. Observed Performance Characteristics
 
-Measurements from recorded runs (16 threads, TPC-H SF10):
-- **Parquet Loading**: Multi-threaded row group loading loads all SF10 tables into memory in **7,730.54 ms** (down from 66,017.10 ms sequential).
-- **Inner Join Build Reversal**:
-  - Query 9 execute time reduced from $> 300,000\text{ ms}$ (timeout) to **15,818.68 ms**.
-  - Query 17 execute time reduced from $117,023.56\text{ ms}$ to **27,212.44 ms**.
-  - Query 5 execute time reduced from $86,000.00\text{ ms}$ to **4,911.80 ms**.
-- **Parallel Partitioned Hash Join Build**:
-  - Query 3 median execute time reduced from **2,450.14 ms** to **1,287.94 ms**.
-  - Query 5 median execute time reduced from **6,853.07 ms** to **2,665.25 ms**.
-  - Query 9 median execute time reduced from **20,649.86 ms** to **11,115.58 ms**.
-  - Query 18 median execute time reduced from **50,067.23 ms** to **26,880.62 ms**.
-  - Query 21 median execute time reduced from **40,817.94 ms** to **11,088.56 ms**.
-- **End-to-End Suite**: All 22 TPC-H queries pass reference checks at SF1 (33.5 s wall time) and SF10 (321.1 s wall time).
+Measurements from recorded development runs (16 threads, TPC-H SF10). The machine was shared with another job
+during these runs, so treat them as before/after comparisons on the same machine, not as benchmark results.
+- **Parquet loading**: loading all SF10 tables takes 7,730.54 ms with parallel row-group decoding, down from
+  66,017.10 ms when each file was decoded on one thread.
+- **Inner join build on the smaller side**: Q9 execute time went from a timeout at 300 s to 15,818.68 ms; Q17 from
+  117,023.56 ms to 27,212.44 ms.
+- **Parallel partitioned hash join build** (median of 3 runs each):
+  - Q3: 2,450.14 ms to 1,287.94 ms
+  - Q5: 6,853.07 ms to 2,665.25 ms
+  - Q9: 20,649.86 ms to 11,115.58 ms
+  - Q18: 50,067.23 ms to 26,880.62 ms
+  - Q21: 40,817.94 ms to 11,088.56 ms
+- **End-to-end suite**: all 22 TPC-H queries pass the reference check at SF1 (26.4 s total wall time, including
+  loading the data for each query) and SF10 (227.4 s).
