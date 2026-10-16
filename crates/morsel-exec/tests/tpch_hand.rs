@@ -879,3 +879,474 @@ fn test_tpch_q3_q4_q5() {
     let p5 = plan_q05(&catalog);
     check_query(5, &p5, &catalog);
 }
+
+pub fn plan_q10(catalog: &Catalog) -> LogicalPlan {
+    let cust_schema = catalog.table_schema("customer").unwrap();
+    let orders_schema = catalog.table_schema("orders").unwrap();
+    let lineitem_schema = catalog.table_schema("lineitem").unwrap();
+    let nation_schema = catalog.table_schema("nation").unwrap();
+
+    let idx_c_custkey = cust_schema.index_of("c_custkey").unwrap();
+    let idx_c_name = cust_schema.index_of("c_name").unwrap();
+    let idx_c_address = cust_schema.index_of("c_address").unwrap();
+    let idx_c_nationkey = cust_schema.index_of("c_nationkey").unwrap();
+    let idx_c_phone = cust_schema.index_of("c_phone").unwrap();
+    let idx_c_acctbal = cust_schema.index_of("c_acctbal").unwrap();
+    let idx_c_comment = cust_schema.index_of("c_comment").unwrap();
+
+    let idx_n_nationkey = nation_schema.index_of("n_nationkey").unwrap();
+    let idx_n_name = nation_schema.index_of("n_name").unwrap();
+
+    let idx_o_orderkey = orders_schema.index_of("o_orderkey").unwrap();
+    let idx_o_custkey = orders_schema.index_of("o_custkey").unwrap();
+    let idx_o_orderdate = orders_schema.index_of("o_orderdate").unwrap();
+
+    let idx_l_orderkey = lineitem_schema.index_of("l_orderkey").unwrap();
+    let idx_l_extendedprice = lineitem_schema.index_of("l_extendedprice").unwrap();
+    let idx_l_discount = lineitem_schema.index_of("l_discount").unwrap();
+    let idx_l_returnflag = lineitem_schema.index_of("l_returnflag").unwrap();
+
+    let nation_scan = LogicalPlan::Scan {
+        table: "nation".to_string(),
+        columns: vec![idx_n_nationkey, idx_n_name],
+        table_schema: nation_schema,
+    };
+
+    let cust_scan = LogicalPlan::Scan {
+        table: "customer".to_string(),
+        columns: vec![
+            idx_c_custkey,
+            idx_c_name,
+            idx_c_address,
+            idx_c_nationkey,
+            idx_c_phone,
+            idx_c_acctbal,
+            idx_c_comment,
+        ],
+        table_schema: cust_schema,
+    };
+    let cust_nation_join = LogicalPlan::Join {
+        left: Box::new(cust_scan),
+        right: Box::new(nation_scan),
+        join_type: JoinType::Inner,
+        on: vec![(Expr::Column(3), Expr::Column(0))],
+        filter: None,
+    };
+    let cust_nation = LogicalPlan::Project {
+        input: Box::new(cust_nation_join),
+        exprs: vec![
+            (Expr::Column(0), "c_custkey".to_string()),
+            (Expr::Column(1), "c_name".to_string()),
+            (Expr::Column(5), "c_acctbal".to_string()),
+            (Expr::Column(8), "n_name".to_string()),
+            (Expr::Column(2), "c_address".to_string()),
+            (Expr::Column(4), "c_phone".to_string()),
+            (Expr::Column(6), "c_comment".to_string()),
+        ],
+    };
+
+    let orders_scan = LogicalPlan::Scan {
+        table: "orders".to_string(),
+        columns: vec![idx_o_orderkey, idx_o_custkey, idx_o_orderdate],
+        table_schema: orders_schema,
+    };
+    let orders_filter = LogicalPlan::Filter {
+        input: Box::new(orders_scan),
+        predicate: Expr::Binary {
+            op: BinOp::And,
+            left: Box::new(Expr::Binary {
+                op: BinOp::GtEq,
+                left: Box::new(Expr::Column(2)),
+                right: Box::new(Expr::Literal(Scalar::Date32(date_to_days("1993-10-01")))),
+            }),
+            right: Box::new(Expr::Binary {
+                op: BinOp::Lt,
+                left: Box::new(Expr::Column(2)),
+                right: Box::new(Expr::Literal(Scalar::Date32(date_to_days("1994-01-01")))),
+            }),
+        },
+    };
+    let orders_project = LogicalPlan::Project {
+        input: Box::new(orders_filter),
+        exprs: vec![
+            (Expr::Column(0), "o_orderkey".to_string()),
+            (Expr::Column(1), "o_custkey".to_string()),
+        ],
+    };
+
+    let lineitem_scan = LogicalPlan::Scan {
+        table: "lineitem".to_string(),
+        columns: vec![
+            idx_l_orderkey,
+            idx_l_extendedprice,
+            idx_l_discount,
+            idx_l_returnflag,
+        ],
+        table_schema: lineitem_schema,
+    };
+    let lineitem_filter = LogicalPlan::Filter {
+        input: Box::new(lineitem_scan),
+        predicate: Expr::Binary {
+            op: BinOp::Eq,
+            left: Box::new(Expr::Column(3)),
+            right: Box::new(Expr::Literal(Scalar::Utf8("R".to_string()))),
+        },
+    };
+    let disc_price = Expr::Binary {
+        op: BinOp::Mul,
+        left: Box::new(Expr::Column(1)),
+        right: Box::new(Expr::Binary {
+            op: BinOp::Sub,
+            left: Box::new(Expr::Literal(Scalar::Int32(1))),
+            right: Box::new(Expr::Column(2)),
+        }),
+    };
+    let lineitem_project = LogicalPlan::Project {
+        input: Box::new(lineitem_filter),
+        exprs: vec![
+            (Expr::Column(0), "l_orderkey".to_string()),
+            (disc_price, "disc_price".to_string()),
+        ],
+    };
+
+    let line_orders_join = LogicalPlan::Join {
+        left: Box::new(lineitem_project),
+        right: Box::new(orders_project),
+        join_type: JoinType::Inner,
+        on: vec![(Expr::Column(0), Expr::Column(0))],
+        filter: None,
+    };
+    let line_orders = LogicalPlan::Project {
+        input: Box::new(line_orders_join),
+        exprs: vec![
+            (Expr::Column(3), "o_custkey".to_string()),
+            (Expr::Column(1), "disc_price".to_string()),
+        ],
+    };
+
+    let join_all = LogicalPlan::Join {
+        left: Box::new(line_orders),
+        right: Box::new(cust_nation),
+        join_type: JoinType::Inner,
+        on: vec![(Expr::Column(0), Expr::Column(0))],
+        filter: None,
+    };
+
+    let agg = LogicalPlan::Aggregate {
+        input: Box::new(join_all),
+        group_by: vec![
+            (Expr::Column(2), "c_custkey".to_string()),
+            (Expr::Column(3), "c_name".to_string()),
+            (Expr::Column(4), "c_acctbal".to_string()),
+            (Expr::Column(7), "c_phone".to_string()),
+            (Expr::Column(5), "n_name".to_string()),
+            (Expr::Column(6), "c_address".to_string()),
+            (Expr::Column(8), "c_comment".to_string()),
+        ],
+        aggs: vec![(
+            AggExpr {
+                func: AggFunc::Sum,
+                arg: Some(Expr::Column(1)),
+            },
+            "revenue".to_string(),
+        )],
+    };
+
+    let project_out = LogicalPlan::Project {
+        input: Box::new(agg),
+        exprs: vec![
+            (Expr::Column(0), "c_custkey".to_string()),
+            (Expr::Column(1), "c_name".to_string()),
+            (Expr::Column(7), "revenue".to_string()),
+            (Expr::Column(2), "c_acctbal".to_string()),
+            (Expr::Column(4), "n_name".to_string()),
+            (Expr::Column(5), "c_address".to_string()),
+            (Expr::Column(3), "c_phone".to_string()),
+            (Expr::Column(6), "c_comment".to_string()),
+        ],
+    };
+
+    let sort = LogicalPlan::Sort {
+        input: Box::new(project_out),
+        keys: vec![SortKey {
+            expr: Expr::Column(2),
+            asc: false,
+            nulls_first: false,
+        }],
+    };
+
+    LogicalPlan::Limit {
+        input: Box::new(sort),
+        n: 20,
+    }
+}
+
+pub fn plan_q12(catalog: &Catalog) -> LogicalPlan {
+    let orders_schema = catalog.table_schema("orders").unwrap();
+    let lineitem_schema = catalog.table_schema("lineitem").unwrap();
+
+    let idx_o_orderkey = orders_schema.index_of("o_orderkey").unwrap();
+    let idx_o_orderpriority = orders_schema.index_of("o_orderpriority").unwrap();
+
+    let idx_l_orderkey = lineitem_schema.index_of("l_orderkey").unwrap();
+    let idx_l_shipmode = lineitem_schema.index_of("l_shipmode").unwrap();
+    let idx_l_commitdate = lineitem_schema.index_of("l_commitdate").unwrap();
+    let idx_l_receiptdate = lineitem_schema.index_of("l_receiptdate").unwrap();
+    let idx_l_shipdate = lineitem_schema.index_of("l_shipdate").unwrap();
+
+    let orders_scan = LogicalPlan::Scan {
+        table: "orders".to_string(),
+        columns: vec![idx_o_orderkey, idx_o_orderpriority],
+        table_schema: orders_schema,
+    };
+
+    let lineitem_scan = LogicalPlan::Scan {
+        table: "lineitem".to_string(),
+        columns: vec![
+            idx_l_orderkey,
+            idx_l_shipmode,
+            idx_l_commitdate,
+            idx_l_receiptdate,
+            idx_l_shipdate,
+        ],
+        table_schema: lineitem_schema,
+    };
+
+    let pred_mode = Expr::InList {
+        expr: Box::new(Expr::Column(1)),
+        list: vec![
+            Scalar::Utf8("MAIL".to_string()),
+            Scalar::Utf8("SHIP".to_string()),
+        ],
+        negated: false,
+    };
+    let pred_commit = Expr::Binary {
+        op: BinOp::Lt,
+        left: Box::new(Expr::Column(2)),
+        right: Box::new(Expr::Column(3)),
+    };
+    let pred_ship = Expr::Binary {
+        op: BinOp::Lt,
+        left: Box::new(Expr::Column(4)),
+        right: Box::new(Expr::Column(2)),
+    };
+    let pred_rec1 = Expr::Binary {
+        op: BinOp::GtEq,
+        left: Box::new(Expr::Column(3)),
+        right: Box::new(Expr::Literal(Scalar::Date32(date_to_days("1994-01-01")))),
+    };
+    let pred_rec2 = Expr::Binary {
+        op: BinOp::Lt,
+        left: Box::new(Expr::Column(3)),
+        right: Box::new(Expr::Literal(Scalar::Date32(date_to_days("1995-01-01")))),
+    };
+
+    let lineitem_pred = Expr::Binary {
+        op: BinOp::And,
+        left: Box::new(Expr::Binary {
+            op: BinOp::And,
+            left: Box::new(pred_mode),
+            right: Box::new(pred_commit),
+        }),
+        right: Box::new(Expr::Binary {
+            op: BinOp::And,
+            left: Box::new(pred_ship),
+            right: Box::new(Expr::Binary {
+                op: BinOp::And,
+                left: Box::new(pred_rec1),
+                right: Box::new(pred_rec2),
+            }),
+        }),
+    };
+
+    let lineitem_filter = LogicalPlan::Filter {
+        input: Box::new(lineitem_scan),
+        predicate: lineitem_pred,
+    };
+    let lineitem_project = LogicalPlan::Project {
+        input: Box::new(lineitem_filter),
+        exprs: vec![
+            (Expr::Column(0), "l_orderkey".to_string()),
+            (Expr::Column(1), "l_shipmode".to_string()),
+        ],
+    };
+
+    let join = LogicalPlan::Join {
+        left: Box::new(lineitem_project),
+        right: Box::new(orders_scan),
+        join_type: JoinType::Inner,
+        on: vec![(Expr::Column(0), Expr::Column(0))],
+        filter: None,
+    };
+
+    let is_urgent = Expr::Binary {
+        op: BinOp::Eq,
+        left: Box::new(Expr::Column(3)),
+        right: Box::new(Expr::Literal(Scalar::Utf8("1-URGENT".to_string()))),
+    };
+    let is_high = Expr::Binary {
+        op: BinOp::Eq,
+        left: Box::new(Expr::Column(3)),
+        right: Box::new(Expr::Literal(Scalar::Utf8("2-HIGH".to_string()))),
+    };
+    let high_cond = Expr::Binary {
+        op: BinOp::Or,
+        left: Box::new(is_urgent),
+        right: Box::new(is_high),
+    };
+    let high_case = Expr::Case {
+        whens: vec![(high_cond.clone(), Expr::Literal(Scalar::Int64(1)))],
+        else_expr: Some(Box::new(Expr::Literal(Scalar::Int64(0)))),
+    };
+    let low_cond = Expr::Not(Box::new(high_cond));
+    let low_case = Expr::Case {
+        whens: vec![(low_cond, Expr::Literal(Scalar::Int64(1)))],
+        else_expr: Some(Box::new(Expr::Literal(Scalar::Int64(0)))),
+    };
+
+    let project_cases = LogicalPlan::Project {
+        input: Box::new(join),
+        exprs: vec![
+            (Expr::Column(1), "l_shipmode".to_string()),
+            (high_case, "high_case".to_string()),
+            (low_case, "low_case".to_string()),
+        ],
+    };
+
+    let agg = LogicalPlan::Aggregate {
+        input: Box::new(project_cases),
+        group_by: vec![(Expr::Column(0), "l_shipmode".to_string())],
+        aggs: vec![
+            (
+                AggExpr {
+                    func: AggFunc::Sum,
+                    arg: Some(Expr::Column(1)),
+                },
+                "high_line_count".to_string(),
+            ),
+            (
+                AggExpr {
+                    func: AggFunc::Sum,
+                    arg: Some(Expr::Column(2)),
+                },
+                "low_line_count".to_string(),
+            ),
+        ],
+    };
+
+    LogicalPlan::Sort {
+        input: Box::new(agg),
+        keys: vec![SortKey {
+            expr: Expr::Column(0),
+            asc: true,
+            nulls_first: false,
+        }],
+    }
+}
+
+pub fn plan_q13(catalog: &Catalog) -> LogicalPlan {
+    let cust_schema = catalog.table_schema("customer").unwrap();
+    let orders_schema = catalog.table_schema("orders").unwrap();
+
+    let idx_c_custkey = cust_schema.index_of("c_custkey").unwrap();
+
+    let idx_o_orderkey = orders_schema.index_of("o_orderkey").unwrap();
+    let idx_o_custkey = orders_schema.index_of("o_custkey").unwrap();
+    let idx_o_comment = orders_schema.index_of("o_comment").unwrap();
+
+    let cust_scan = LogicalPlan::Scan {
+        table: "customer".to_string(),
+        columns: vec![idx_c_custkey],
+        table_schema: cust_schema,
+    };
+
+    let orders_scan = LogicalPlan::Scan {
+        table: "orders".to_string(),
+        columns: vec![idx_o_orderkey, idx_o_custkey, idx_o_comment],
+        table_schema: orders_schema,
+    };
+    let orders_filter = LogicalPlan::Filter {
+        input: Box::new(orders_scan),
+        predicate: Expr::Like {
+            expr: Box::new(Expr::Column(2)),
+            pattern: "%special%requests%".to_string(),
+            negated: true,
+        },
+    };
+    let orders_project = LogicalPlan::Project {
+        input: Box::new(orders_filter),
+        exprs: vec![
+            (Expr::Column(0), "o_orderkey".to_string()),
+            (Expr::Column(1), "o_custkey".to_string()),
+        ],
+    };
+
+    let left_join = LogicalPlan::Join {
+        left: Box::new(cust_scan),
+        right: Box::new(orders_project),
+        join_type: JoinType::Left,
+        on: vec![(Expr::Column(0), Expr::Column(1))],
+        filter: None,
+    };
+
+    let inner_agg = LogicalPlan::Aggregate {
+        input: Box::new(left_join),
+        group_by: vec![(Expr::Column(0), "c_custkey".to_string())],
+        aggs: vec![(
+            AggExpr {
+                func: AggFunc::Count,
+                arg: Some(Expr::Column(1)),
+            },
+            "c_count".to_string(),
+        )],
+    };
+
+    let outer_agg = LogicalPlan::Aggregate {
+        input: Box::new(inner_agg),
+        group_by: vec![(Expr::Column(1), "c_count".to_string())],
+        aggs: vec![(
+            AggExpr {
+                func: AggFunc::CountStar,
+                arg: None,
+            },
+            "custdist".to_string(),
+        )],
+    };
+
+    LogicalPlan::Sort {
+        input: Box::new(outer_agg),
+        keys: vec![
+            SortKey {
+                expr: Expr::Column(1),
+                asc: false,
+                nulls_first: false,
+            },
+            SortKey {
+                expr: Expr::Column(0),
+                asc: false,
+                nulls_first: false,
+            },
+        ],
+    }
+}
+
+#[test]
+fn test_tpch_q10_q12_q13() {
+    let tpch_dir = match std::env::var("MORSEL_TPCH_DIR") {
+        Ok(d) => PathBuf::from(d),
+        Err(_) => {
+            eprintln!("MORSEL_TPCH_DIR is not set; skipping tpch_hand test");
+            return;
+        }
+    };
+    let catalog = load_parquet_dir(&tpch_dir, 16).expect("load parquet dir");
+
+    let p10 = plan_q10(&catalog);
+    check_query(10, &p10, &catalog);
+
+    let p12 = plan_q12(&catalog);
+    check_query(12, &p12, &catalog);
+
+    let p13 = plan_q13(&catalog);
+    check_query(13, &p13, &catalog);
+}
