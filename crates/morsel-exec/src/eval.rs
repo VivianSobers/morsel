@@ -318,10 +318,9 @@ pub fn eval(expr: &Expr, batch: &Batch) -> Result<Column> {
                 } else {
                     let s = col.utf8_value(i);
                     let chars: Vec<char> = s.chars().collect();
-                    let s_idx = if *start > 0 { (*start - 1) as usize } else { 0 };
-                    let len_c = (*len).max(0) as usize;
-                    let e_idx = (s_idx + len_c).min(chars.len());
-                    let sub: String = if s_idx < chars.len() {
+                    let s_idx = ((*start - 1).max(0) as usize).min(chars.len());
+                    let e_idx = ((*start + *len - 1).max(0) as usize).min(chars.len());
+                    let sub: String = if *len > 0 && s_idx < e_idx {
                         chars[s_idx..e_idx].iter().collect()
                     } else {
                         String::new()

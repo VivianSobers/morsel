@@ -475,6 +475,39 @@ fn substring_one_based() {
 }
 
 #[test]
+fn substring_non_positive_start() {
+    let schema = Arc::new(Schema {
+        fields: vec![Field {
+            name: "text".to_string(),
+            dtype: DataType::Utf8,
+            nullable: false,
+        }],
+    });
+    let batch = Batch::new(
+        schema,
+        vec![Arc::new(Column::from_scalars(
+            DataType::Utf8,
+            &[Scalar::Utf8("hello".to_string())],
+        ))],
+    );
+    let substr1 = Expr::Substring {
+        expr: Box::new(Expr::Column(0)),
+        start: 0,
+        len: 3,
+    };
+    let res1 = eval(&substr1, &batch).unwrap();
+    assert_eq!(res1.get(0), Scalar::Utf8("he".to_string()));
+
+    let substr2 = Expr::Substring {
+        expr: Box::new(Expr::Column(0)),
+        start: -1,
+        len: 3,
+    };
+    let res2 = eval(&substr2, &batch).unwrap();
+    assert_eq!(res2.get(0), Scalar::Utf8("h".to_string()));
+}
+
+#[test]
 fn cast_int_to_decimal() {
     let schema = Arc::new(Schema {
         fields: vec![Field {
