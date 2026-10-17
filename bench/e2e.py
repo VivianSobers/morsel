@@ -102,7 +102,6 @@ def find_morsel_binary(explicit_path: Optional[str] = None) -> str:
     if "CARGO_TARGET_DIR" in os.environ:
         candidates.append(os.path.join(os.environ["CARGO_TARGET_DIR"], "release", "morsel"))
     candidates.extend([
-        "/dev/shm/morsel-alt/target/release/morsel",
         os.path.join(REPO_ROOT, "target", "release", "morsel"),
     ])
 

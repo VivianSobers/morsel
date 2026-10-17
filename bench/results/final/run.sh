@@ -3,7 +3,7 @@
 # usage: morsel_bench.sh COMMIT THREADS
 set -u
 c=$1; t=$2
-d=/dev/shm/morsel-alt/tpch
+d=${TPCH_DIR:?set TPCH_DIR to the directory holding sf1, sf10 and sf10_refs}
 out=$HOME/morsel-bench/bench/results/final
 export PATH=$HOME/.cargo/bin:$PATH CARGO_TARGET_DIR=/dev/shm/morsel-bench-target CARGO_BUILD_JOBS=16
 cd ~/morsel-bench && git checkout -q --detach $c || exit 1

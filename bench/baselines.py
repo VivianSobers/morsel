@@ -188,18 +188,6 @@ def run_datafusion(args, queries: List[Tuple[int, str, str]]) -> Tuple[str, Any]
     return df.__version__, execute_fn
 
 
-def resolve_dir(p: Optional[str]) -> Optional[str]:
-    if not p:
-        return p
-    if os.path.isdir(p) and len(os.listdir(p)) > 0:
-        return p
-    if p.startswith("/dev/shm/morsel"):
-        snap_p = p.replace("/dev/shm/morsel", "/dev/shm/morsel-alt", 1)
-        if os.path.isdir(snap_p) and len(os.listdir(snap_p)) > 0:
-            return snap_p
-    return p
-
-
 def main():
     parser = argparse.ArgumentParser(description="TPC-H baseline runners")
     parser.add_argument(
@@ -239,11 +227,10 @@ def main():
     )
     args = parser.parse_args()
 
-    args.data_dir = resolve_dir(args.data_dir)
-    refs_dir = resolve_dir(args.refs_dir)
+    refs_dir = args.refs_dir
     if not refs_dir:
         sf_int = int(args.sf) if args.sf.is_integer() else args.sf
-        refs_dir = resolve_dir(f"bench/refs/sf{sf_int}")
+        refs_dir = f"bench/refs/sf{sf_int}"
 
     # Load query files (engine-specific query text if present, otherwise default)
     query_nums = parse_query_selection(args.queries)
