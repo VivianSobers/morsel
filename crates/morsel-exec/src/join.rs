@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use ahash::AHashMap;
 use anyhow::Result;
-use morsel_core::{Batch, Column, DataType, Scalar, Schema, BATCH_ROWS};
+use morsel_core::{Batch, Column, ColumnData, DataType, Scalar, Schema, BATCH_ROWS};
 use morsel_plan::{Expr, JoinType, LogicalPlan};
 
 use crate::aggregate::{column_get_key, ScalarKey};
@@ -15,29 +15,50 @@ use crate::scheduler::create_morsels;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum JoinKey {
-    Single(ScalarKey),
-    Two(ScalarKey, ScalarKey),
-    Multi(Vec<ScalarKey>),
+    I64(i64),
+    I32(i32),
+    Date32(i32),
+    TwoI64(i64, i64),
+    Decimal(Box<(i128, u8)>),
+    Str(Box<str>),
+    Single(Box<ScalarKey>),
+    Two(Box<(ScalarKey, ScalarKey)>),
+    Multi(Box<[ScalarKey]>),
 }
 
 pub fn extract_join_key(cols: &[Column], row_idx: usize) -> Option<JoinKey> {
     match cols.len() {
         1 => {
-            if cols[0].is_null(row_idx) {
-                None
-            } else {
-                Some(JoinKey::Single(column_get_key(&cols[0], row_idx)))
+            let col = &cols[0];
+            if col.is_null(row_idx) {
+                return None;
+            }
+            match &col.data {
+                ColumnData::Int64(v) => Some(JoinKey::I64(v[row_idx])),
+                ColumnData::Int32(v) => Some(JoinKey::I32(v[row_idx])),
+                ColumnData::Date32(v) => Some(JoinKey::Date32(v[row_idx])),
+                ColumnData::Decimal(v) => {
+                    let scale = match col.dtype {
+                        DataType::Decimal { scale, .. } => scale,
+                        _ => 0,
+                    };
+                    Some(JoinKey::Decimal(Box::new((v[row_idx], scale))))
+                }
+                ColumnData::Utf8 { .. } => Some(JoinKey::Str(col.utf8_value(row_idx).into())),
+                _ => Some(JoinKey::Single(Box::new(column_get_key(col, row_idx)))),
             }
         }
         2 => {
             if cols[0].is_null(row_idx) || cols[1].is_null(row_idx) {
-                None
-            } else {
-                Some(JoinKey::Two(
-                    column_get_key(&cols[0], row_idx),
-                    column_get_key(&cols[1], row_idx),
-                ))
+                return None;
             }
+            if let (ColumnData::Int64(v1), ColumnData::Int64(v2)) = (&cols[0].data, &cols[1].data) {
+                return Some(JoinKey::TwoI64(v1[row_idx], v2[row_idx]));
+            }
+            Some(JoinKey::Two(Box::new((
+                column_get_key(&cols[0], row_idx),
+                column_get_key(&cols[1], row_idx),
+            ))))
         }
         _ => {
             let mut v = Vec::with_capacity(cols.len());
@@ -47,7 +68,7 @@ pub fn extract_join_key(cols: &[Column], row_idx: usize) -> Option<JoinKey> {
                 }
                 v.push(column_get_key(col, row_idx));
             }
-            Some(JoinKey::Multi(v))
+            Some(JoinKey::Multi(v.into_boxed_slice()))
         }
     }
 }
@@ -150,7 +171,7 @@ impl BatchBuilder {
         let num_cols = schema.fields.len();
         Self {
             schema,
-            columns: vec![Vec::with_capacity(BATCH_ROWS); num_cols],
+            columns: vec![Vec::with_capacity(1024.min(BATCH_ROWS)); num_cols],
             batches: Vec::new(),
         }
     }
@@ -271,6 +292,7 @@ fn shift_expr_columns(expr: &Expr, offset: usize) -> Expr {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn test_filter_pair(
     filter: &Expr,
     left_batch: &Batch,
@@ -279,19 +301,23 @@ fn test_filter_pair(
     loc: RowLoc,
     combined_schema: &Arc<Schema>,
     referenced_cols: &[usize],
+    null_cols: &[Arc<Column>],
 ) -> Result<bool> {
     let mut cols = Vec::with_capacity(combined_schema.fields.len());
     let l_len = left_batch.columns.len();
-    for (i, field) in combined_schema.fields.iter().enumerate() {
+    for (i, _) in combined_schema.fields.iter().enumerate() {
         if referenced_cols.contains(&i) {
             let s = if i < l_len {
                 left_batch.columns[i].get(l_idx)
             } else {
                 right_batches[loc.batch_idx as usize].columns[i - l_len].get(loc.row_idx as usize)
             };
-            cols.push(Arc::new(Column::from_scalars(field.dtype, &[s])));
+            cols.push(Arc::new(Column::from_scalars(
+                combined_schema.fields[i].dtype,
+                &[s],
+            )));
         } else {
-            cols.push(Arc::new(Column::from_scalars(field.dtype, &[Scalar::Null])));
+            cols.push(Arc::clone(&null_cols[i]));
         }
     }
     let b = Batch::new(Arc::clone(combined_schema), cols);
@@ -333,8 +359,6 @@ pub fn execute_join(
     catalog: &Catalog,
     threads: usize,
 ) -> Result<Vec<Batch>> {
-    let right_batches = execute(right, catalog, threads)?;
-    let left_batches = execute(left, catalog, threads)?;
     let left_schema = left.schema()?;
     let right_schema = right.schema()?;
     let l_cols_len = left_schema.fields.len();
@@ -351,6 +375,51 @@ pub fn execute_join(
         referenced_cols.sort_unstable();
         referenced_cols.dedup();
     }
+
+    let mut right_batches = execute(right, catalog, threads)?;
+
+    // Prune unused right columns for Semi and Anti joins immediately to free memory
+    if matches!(join_type, JoinType::Semi | JoinType::Anti) {
+        let mut needed_right = std::collections::HashSet::new();
+        for (_, r_expr) in on {
+            let mut cols = Vec::new();
+            expr_referenced_columns(r_expr, &mut cols);
+            needed_right.extend(cols);
+        }
+        if let Some(ref rf) = right_filter {
+            let mut cols = Vec::new();
+            expr_referenced_columns(rf, &mut cols);
+            needed_right.extend(cols);
+        }
+        for &idx in &referenced_cols {
+            if idx >= l_cols_len {
+                needed_right.insert(idx - l_cols_len);
+            }
+        }
+
+        for batch in &mut right_batches {
+            let len = batch.len;
+            let mut new_cols = Vec::with_capacity(batch.columns.len());
+            for (c, col) in batch.columns.iter().enumerate() {
+                if needed_right.contains(&c) {
+                    new_cols.push(Arc::clone(col));
+                } else {
+                    new_cols.push(Arc::new(Column {
+                        dtype: col.dtype,
+                        data: ColumnData::Int32(Vec::new()),
+                        validity: None,
+                    }));
+                }
+            }
+            *batch = Batch {
+                schema: Arc::clone(&batch.schema),
+                columns: new_cols,
+                len,
+            };
+        }
+    }
+
+    let left_batches = execute(left, catalog, threads)?;
 
     let key_types: Vec<DataType> = on
         .iter()
@@ -440,8 +509,11 @@ pub fn execute_join(
                     };
 
                     s.spawn(move || {
-                        let mut t_buf: Vec<Vec<(JoinKey, RowLoc)>> =
-                            (0..num_partitions).map(|_| Vec::new()).collect();
+                        let init_cap =
+                            (build_total_rows / num_partitions / num_threads).clamp(64, 32768);
+                        let mut t_buf: Vec<Vec<(JoinKey, RowLoc)>> = (0..num_partitions)
+                            .map(|_| Vec::with_capacity(init_cap))
+                            .collect();
                         loop {
                             if cancelled_ref.load(Ordering::Relaxed) {
                                 break;
@@ -535,6 +607,29 @@ pub fn execute_join(
             return Err(err);
         }
 
+        // After Phase 1 build is done, the hash table has been populated with join keys.
+        // For Semi and Anti joins, the only right columns ever needed during probe are
+        // those referenced by residual_filter. Drop any others now to free more memory!
+        if matches!(join_type, JoinType::Semi | JoinType::Anti) {
+            let mut probe_needed = std::collections::HashSet::new();
+            for &idx in &referenced_cols {
+                if idx >= l_cols_len {
+                    probe_needed.insert(idx - l_cols_len);
+                }
+            }
+            for batch in &mut right_batches {
+                for (c, col) in batch.columns.iter_mut().enumerate() {
+                    if !probe_needed.contains(&c) && !col.is_empty() {
+                        *col = Arc::new(Column {
+                            dtype: col.dtype,
+                            data: ColumnData::Int32(Vec::new()),
+                            validity: None,
+                        });
+                    }
+                }
+            }
+        }
+
         // Phase 2: Build partition tables in parallel
         let partition_inputs: PartitionInputBuffers = (0..num_partitions)
             .map(|p| {
@@ -563,12 +658,13 @@ pub fn execute_join(
                             }
                             let bufs = p_inputs[p].lock().unwrap().take().unwrap();
                             let total_entries: usize = bufs.iter().map(|b| b.len()).sum();
-                            let mut map = AHashMap::with_capacity(total_entries);
+                            let map_cap = (total_entries / 2).max(1);
+                            let mut map = AHashMap::with_capacity(map_cap);
                             let mut locs = Vec::with_capacity(total_entries);
                             let mut next = Vec::with_capacity(total_entries);
 
-                            for thread_buf in bufs {
-                                for (key, loc) in thread_buf {
+                            for mut thread_buf in bufs {
+                                for (key, loc) in thread_buf.drain(..) {
                                     let entry_idx = locs.len() as u32;
                                     locs.push(loc);
                                     next.push(u32::MAX);
@@ -587,6 +683,7 @@ pub fn execute_join(
                                         }
                                     }
                                 }
+                                drop(thread_buf);
                             }
                             built.push((p, PartitionTable { map, locs, next }));
                         }
@@ -634,6 +731,12 @@ pub fn execute_join(
         (0..num_morsels).map(|_| Mutex::new(Vec::new())).collect();
     let error_cell = Mutex::new(None);
 
+    let null_cols: Vec<Arc<Column>> = combined_schema
+        .fields
+        .iter()
+        .map(|f| Arc::new(Column::from_scalars(f.dtype, &[Scalar::Null])))
+        .collect();
+
     std::thread::scope(|s| {
         for _ in 0..num_threads {
             let next_ref = &next_morsel;
@@ -652,6 +755,7 @@ pub fn execute_join(
             let filter = residual_filter;
             let ref_cols = &referenced_cols;
             let r_filter = right_filter.as_ref();
+            let n_cols = &null_cols;
 
             s.spawn(move || loop {
                 if cancelled_ref.load(Ordering::Relaxed) {
@@ -740,6 +844,7 @@ pub fn execute_join(
                                             },
                                             comb_sch,
                                             ref_cols,
+                                            n_cols,
                                         ) {
                                             Ok(true) => {}
                                             Ok(false) => continue,
@@ -804,7 +909,7 @@ pub fn execute_join(
                                             if let Some(f) = filter {
                                                 match test_filter_pair(
                                                     f, l_batch, l_idx, r_batches, loc, comb_sch,
-                                                    ref_cols,
+                                                    ref_cols, n_cols,
                                                 ) {
                                                     Ok(true) => {}
                                                     Ok(false) => continue,
@@ -838,7 +943,7 @@ pub fn execute_join(
                                             if let Some(f) = filter {
                                                 match test_filter_pair(
                                                     f, l_batch, l_idx, r_batches, loc, comb_sch,
-                                                    ref_cols,
+                                                    ref_cols, n_cols,
                                                 ) {
                                                     Ok(true) => {}
                                                     Ok(false) => continue,
@@ -880,7 +985,7 @@ pub fn execute_join(
                                             for loc in matched_locs {
                                                 match test_filter_pair(
                                                     f, l_batch, l_idx, r_batches, loc, comb_sch,
-                                                    ref_cols,
+                                                    ref_cols, n_cols,
                                                 ) {
                                                     Ok(true) => {
                                                         matched = true;
@@ -916,7 +1021,7 @@ pub fn execute_join(
                                             for loc in matched_locs {
                                                 match test_filter_pair(
                                                     f, l_batch, l_idx, r_batches, loc, comb_sch,
-                                                    ref_cols,
+                                                    ref_cols, n_cols,
                                                 ) {
                                                     Ok(true) => {
                                                         has_matching_right = true;
@@ -958,6 +1063,10 @@ pub fn execute_join(
     if let Some(err) = error_cell.into_inner().unwrap() {
         return Err(err);
     }
+
+    drop(hash_table);
+    drop(left_batches);
+    drop(right_batches);
 
     let all_results: Vec<Batch> = results
         .into_iter()
