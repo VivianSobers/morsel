@@ -277,6 +277,30 @@ pub fn eval(expr: &Expr, batch: &Batch) -> Result<Column> {
             })
         }
         Expr::Binary { op, left, right } => {
+            if matches!(
+                op,
+                BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq
+            ) {
+                if let Expr::Literal(lit) = right.as_ref() {
+                    let left_col = eval(left, batch)?;
+                    if let Some(col) =
+                        crate::kernel::comparison::eval_comparison_col_lit_fast(*op, &left_col, lit)
+                    {
+                        return Ok(col);
+                    }
+                    let right_col = eval(right, batch)?;
+                    return eval_binary(*op, &left_col, &right_col, row_count);
+                } else if let Expr::Literal(lit) = left.as_ref() {
+                    let right_col = eval(right, batch)?;
+                    if let Some(col) = crate::kernel::comparison::eval_comparison_lit_col_fast(
+                        *op, lit, &right_col,
+                    ) {
+                        return Ok(col);
+                    }
+                    let left_col = eval(left, batch)?;
+                    return eval_binary(*op, &left_col, &right_col, row_count);
+                }
+            }
             let left_col = eval(left, batch)?;
             let right_col = eval(right, batch)?;
             eval_binary(*op, &left_col, &right_col, row_count)
@@ -640,6 +664,18 @@ fn eval_or(left: &Column, right: &Column, len: usize) -> Result<Column> {
 }
 
 fn eval_comparison(op: BinOp, left: &Column, right: &Column, len: usize) -> Result<Column> {
+    if let Some(col) = crate::kernel::comparison::eval_comparison_col_col_fast(op, left, right) {
+        return Ok(col);
+    }
+    eval_comparison_generic(op, left, right, len)
+}
+
+pub fn eval_comparison_generic(
+    op: BinOp,
+    left: &Column,
+    right: &Column,
+    len: usize,
+) -> Result<Column> {
     let mut data = Vec::with_capacity(len);
     let mut validity = Vec::with_capacity(len);
     let mut has_null = false;
