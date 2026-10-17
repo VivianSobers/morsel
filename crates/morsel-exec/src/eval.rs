@@ -189,6 +189,16 @@ fn date32_to_year(days: i32) -> i64 {
 
 pub fn eval_predicate(expr: &Expr, batch: &Batch) -> Result<Vec<u32>> {
     let col = eval(expr, batch)?;
+    if let ColumnData::Bool(ref v) = col.data {
+        return Ok(crate::kernel::filter::bool_to_selection(
+            v,
+            col.validity.as_deref(),
+        ));
+    }
+    Ok(Vec::new())
+}
+
+pub fn eval_predicate_generic(col: &Column) -> Vec<u32> {
     let mut selected = Vec::new();
     if let ColumnData::Bool(ref v) = col.data {
         match &col.validity {
@@ -208,7 +218,7 @@ pub fn eval_predicate(expr: &Expr, batch: &Batch) -> Result<Vec<u32>> {
             }
         }
     }
-    Ok(selected)
+    selected
 }
 
 pub fn eval(expr: &Expr, batch: &Batch) -> Result<Column> {
@@ -277,34 +287,60 @@ pub fn eval(expr: &Expr, batch: &Batch) -> Result<Column> {
             })
         }
         Expr::Binary { op, left, right } => {
+            if matches!(
+                op,
+                BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq
+            ) {
+                if let Expr::Literal(lit) = right.as_ref() {
+                    let left_col = eval(left, batch)?;
+                    if let Some(col) =
+                        crate::kernel::comparison::eval_comparison_col_lit_fast(*op, &left_col, lit)
+                    {
+                        return Ok(col);
+                    }
+                    let right_col = eval(right, batch)?;
+                    return eval_binary(*op, &left_col, &right_col, row_count);
+                } else if let Expr::Literal(lit) = left.as_ref() {
+                    let right_col = eval(right, batch)?;
+                    if let Some(col) = crate::kernel::comparison::eval_comparison_lit_col_fast(
+                        *op, lit, &right_col,
+                    ) {
+                        return Ok(col);
+                    }
+                    let left_col = eval(left, batch)?;
+                    return eval_binary(*op, &left_col, &right_col, row_count);
+                }
+            } else if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) {
+                if let Expr::Literal(lit) = right.as_ref() {
+                    let left_col = eval(left, batch)?;
+                    if let Some(col) = crate::kernel::arithmetic::eval_arithmetic_col_lit_fast(
+                        *op, &left_col, lit,
+                    )? {
+                        return Ok(col);
+                    }
+                    let right_col = eval(right, batch)?;
+                    return eval_binary(*op, &left_col, &right_col, row_count);
+                } else if let Expr::Literal(lit) = left.as_ref() {
+                    let right_col = eval(right, batch)?;
+                    if let Some(col) = crate::kernel::arithmetic::eval_arithmetic_lit_col_fast(
+                        *op, lit, &right_col,
+                    )? {
+                        return Ok(col);
+                    }
+                    let left_col = eval(left, batch)?;
+                    return eval_binary(*op, &left_col, &right_col, row_count);
+                }
+            }
             let left_col = eval(left, batch)?;
             let right_col = eval(right, batch)?;
             eval_binary(*op, &left_col, &right_col, row_count)
         }
         Expr::Not(sub) => {
             let col = eval(sub, batch)?;
-            let mut validity = Vec::with_capacity(row_count);
-            let mut data = Vec::with_capacity(row_count);
-            let mut has_null = false;
-            for i in 0..row_count {
-                if col.is_null(i) {
-                    has_null = true;
-                    validity.push(false);
-                    data.push(false);
-                } else {
-                    validity.push(true);
-                    let b = match col.get(i) {
-                        Scalar::Bool(b) => b,
-                        _ => bail!("NOT requires boolean column"),
-                    };
-                    data.push(!b);
-                }
+            if let Some(res) = crate::kernel::boolean::eval_not_fast(&col) {
+                return Ok(res);
             }
-            Ok(Column {
-                dtype: DataType::Bool,
-                data: ColumnData::Bool(data),
-                validity: if has_null { Some(validity) } else { None },
-            })
+            eval_not_generic(&col, row_count)
         }
         Expr::Negate(sub) => {
             let col = eval(sub, batch)?;
@@ -567,7 +603,39 @@ fn eval_binary(op: BinOp, left: &Column, right: &Column, len: usize) -> Result<C
     }
 }
 
+pub fn eval_not_generic(col: &Column, row_count: usize) -> Result<Column> {
+    let mut validity = Vec::with_capacity(row_count);
+    let mut data = Vec::with_capacity(row_count);
+    let mut has_null = false;
+    for i in 0..row_count {
+        if col.is_null(i) {
+            has_null = true;
+            validity.push(false);
+            data.push(false);
+        } else {
+            validity.push(true);
+            let b = match col.get(i) {
+                Scalar::Bool(b) => b,
+                _ => bail!("NOT requires boolean column"),
+            };
+            data.push(!b);
+        }
+    }
+    Ok(Column {
+        dtype: DataType::Bool,
+        data: ColumnData::Bool(data),
+        validity: if has_null { Some(validity) } else { None },
+    })
+}
+
 fn eval_and(left: &Column, right: &Column, len: usize) -> Result<Column> {
+    if let Some(col) = crate::kernel::boolean::eval_and_fast(left, right) {
+        return Ok(col);
+    }
+    eval_and_generic(left, right, len)
+}
+
+pub fn eval_and_generic(left: &Column, right: &Column, len: usize) -> Result<Column> {
     let mut data = Vec::with_capacity(len);
     let mut validity = Vec::with_capacity(len);
     let mut has_null = false;
@@ -604,6 +672,13 @@ fn eval_and(left: &Column, right: &Column, len: usize) -> Result<Column> {
 }
 
 fn eval_or(left: &Column, right: &Column, len: usize) -> Result<Column> {
+    if let Some(col) = crate::kernel::boolean::eval_or_fast(left, right) {
+        return Ok(col);
+    }
+    eval_or_generic(left, right, len)
+}
+
+pub fn eval_or_generic(left: &Column, right: &Column, len: usize) -> Result<Column> {
     let mut data = Vec::with_capacity(len);
     let mut validity = Vec::with_capacity(len);
     let mut has_null = false;
@@ -640,6 +715,18 @@ fn eval_or(left: &Column, right: &Column, len: usize) -> Result<Column> {
 }
 
 fn eval_comparison(op: BinOp, left: &Column, right: &Column, len: usize) -> Result<Column> {
+    if let Some(col) = crate::kernel::comparison::eval_comparison_col_col_fast(op, left, right) {
+        return Ok(col);
+    }
+    eval_comparison_generic(op, left, right, len)
+}
+
+pub fn eval_comparison_generic(
+    op: BinOp,
+    left: &Column,
+    right: &Column,
+    len: usize,
+) -> Result<Column> {
     let mut data = Vec::with_capacity(len);
     let mut validity = Vec::with_capacity(len);
     let mut has_null = false;
@@ -892,6 +979,18 @@ fn scalar_to_f64(s: &Scalar) -> Result<f64> {
 }
 
 fn eval_arithmetic(op: BinOp, left: &Column, right: &Column, len: usize) -> Result<Column> {
+    if let Some(col) = crate::kernel::arithmetic::eval_arithmetic_col_col_fast(op, left, right)? {
+        return Ok(col);
+    }
+    eval_arithmetic_generic(op, left, right, len)
+}
+
+pub fn eval_arithmetic_generic(
+    op: BinOp,
+    left: &Column,
+    right: &Column,
+    len: usize,
+) -> Result<Column> {
     let mut scalars = Vec::with_capacity(len);
     for i in 0..len {
         if left.is_null(i) || right.is_null(i) {
