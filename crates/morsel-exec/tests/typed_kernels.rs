@@ -579,3 +579,48 @@ fn test_arithmetic_fast_vs_generic() {
         }
     }
 }
+
+#[test]
+fn test_boolean_fast_vs_generic() {
+    use morsel_exec::eval::{eval_and_generic, eval_not_generic, eval_or_generic};
+    use morsel_exec::kernel::boolean::{eval_and_fast, eval_not_fast, eval_or_fast};
+
+    const N: usize = 10_000;
+    let mut rng = SimpleRng::new(999);
+
+    let mut v1 = Vec::with_capacity(N);
+    let mut v2 = Vec::with_capacity(N);
+    let mut val1 = Vec::with_capacity(N);
+    let mut val2 = Vec::with_capacity(N);
+    for _ in 0..N {
+        v1.push((rng.next_u64() % 2) == 1);
+        v2.push((rng.next_u64() % 2) == 1);
+        val1.push(rng.next_bool_null(20));
+        val2.push(rng.next_bool_null(20));
+    }
+    let col1 = Column {
+        dtype: DataType::Bool,
+        data: ColumnData::Bool(v1),
+        validity: Some(val1),
+    };
+    let col2 = Column {
+        dtype: DataType::Bool,
+        data: ColumnData::Bool(v2),
+        validity: Some(val2),
+    };
+
+    // Test NOT
+    let fast_not = eval_not_fast(&col1).expect("NOT fast path must be implemented");
+    let generic_not = eval_not_generic(&col1, N).unwrap();
+    assert_eq!(fast_not, generic_not, "NOT mismatch");
+
+    // Test AND
+    let fast_and = eval_and_fast(&col1, &col2).expect("AND fast path must be implemented");
+    let generic_and = eval_and_generic(&col1, &col2, N).unwrap();
+    assert_eq!(fast_and, generic_and, "AND mismatch");
+
+    // Test OR
+    let fast_or = eval_or_fast(&col1, &col2).expect("OR fast path must be implemented");
+    let generic_or = eval_or_generic(&col1, &col2, N).unwrap();
+    assert_eq!(fast_or, generic_or, "OR mismatch");
+}

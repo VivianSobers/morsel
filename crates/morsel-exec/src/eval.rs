@@ -327,28 +327,10 @@ pub fn eval(expr: &Expr, batch: &Batch) -> Result<Column> {
         }
         Expr::Not(sub) => {
             let col = eval(sub, batch)?;
-            let mut validity = Vec::with_capacity(row_count);
-            let mut data = Vec::with_capacity(row_count);
-            let mut has_null = false;
-            for i in 0..row_count {
-                if col.is_null(i) {
-                    has_null = true;
-                    validity.push(false);
-                    data.push(false);
-                } else {
-                    validity.push(true);
-                    let b = match col.get(i) {
-                        Scalar::Bool(b) => b,
-                        _ => bail!("NOT requires boolean column"),
-                    };
-                    data.push(!b);
-                }
+            if let Some(res) = crate::kernel::boolean::eval_not_fast(&col) {
+                return Ok(res);
             }
-            Ok(Column {
-                dtype: DataType::Bool,
-                data: ColumnData::Bool(data),
-                validity: if has_null { Some(validity) } else { None },
-            })
+            eval_not_generic(&col, row_count)
         }
         Expr::Negate(sub) => {
             let col = eval(sub, batch)?;
@@ -611,7 +593,39 @@ fn eval_binary(op: BinOp, left: &Column, right: &Column, len: usize) -> Result<C
     }
 }
 
+pub fn eval_not_generic(col: &Column, row_count: usize) -> Result<Column> {
+    let mut validity = Vec::with_capacity(row_count);
+    let mut data = Vec::with_capacity(row_count);
+    let mut has_null = false;
+    for i in 0..row_count {
+        if col.is_null(i) {
+            has_null = true;
+            validity.push(false);
+            data.push(false);
+        } else {
+            validity.push(true);
+            let b = match col.get(i) {
+                Scalar::Bool(b) => b,
+                _ => bail!("NOT requires boolean column"),
+            };
+            data.push(!b);
+        }
+    }
+    Ok(Column {
+        dtype: DataType::Bool,
+        data: ColumnData::Bool(data),
+        validity: if has_null { Some(validity) } else { None },
+    })
+}
+
 fn eval_and(left: &Column, right: &Column, len: usize) -> Result<Column> {
+    if let Some(col) = crate::kernel::boolean::eval_and_fast(left, right) {
+        return Ok(col);
+    }
+    eval_and_generic(left, right, len)
+}
+
+pub fn eval_and_generic(left: &Column, right: &Column, len: usize) -> Result<Column> {
     let mut data = Vec::with_capacity(len);
     let mut validity = Vec::with_capacity(len);
     let mut has_null = false;
@@ -648,6 +662,13 @@ fn eval_and(left: &Column, right: &Column, len: usize) -> Result<Column> {
 }
 
 fn eval_or(left: &Column, right: &Column, len: usize) -> Result<Column> {
+    if let Some(col) = crate::kernel::boolean::eval_or_fast(left, right) {
+        return Ok(col);
+    }
+    eval_or_generic(left, right, len)
+}
+
+pub fn eval_or_generic(left: &Column, right: &Column, len: usize) -> Result<Column> {
     let mut data = Vec::with_capacity(len);
     let mut validity = Vec::with_capacity(len);
     let mut has_null = false;
