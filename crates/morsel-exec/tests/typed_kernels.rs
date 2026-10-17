@@ -624,3 +624,89 @@ fn test_boolean_fast_vs_generic() {
     let generic_or = eval_or_generic(&col1, &col2, N).unwrap();
     assert_eq!(fast_or, generic_or, "OR mismatch");
 }
+
+#[test]
+fn test_filter_selection_fast_vs_generic() {
+    use morsel_exec::eval::eval_predicate_generic;
+    use morsel_exec::kernel::filter::bool_to_selection;
+
+    const N: usize = 10_000;
+    let mut rng = SimpleRng::new(777);
+
+    // Case 1: Random bools with 20% nulls
+    let mut data1 = Vec::with_capacity(N);
+    let mut val1 = Vec::with_capacity(N);
+    for _ in 0..N {
+        data1.push((rng.next_u64() % 2) == 1);
+        val1.push(rng.next_bool_null(20));
+    }
+    let col1 = Column {
+        dtype: DataType::Bool,
+        data: ColumnData::Bool(data1.clone()),
+        validity: Some(val1.clone()),
+    };
+    let fast1 = bool_to_selection(&data1, Some(&val1));
+    let generic1 = eval_predicate_generic(&col1);
+    assert_eq!(fast1, generic1, "Case 1 random with nulls mismatch");
+
+    // Case 2: Random bools without validity (None)
+    let col2 = Column {
+        dtype: DataType::Bool,
+        data: ColumnData::Bool(data1.clone()),
+        validity: None,
+    };
+    let fast2 = bool_to_selection(&data1, None);
+    let generic2 = eval_predicate_generic(&col2);
+    assert_eq!(fast2, generic2, "Case 2 random without nulls mismatch");
+
+    // Case 3: All false
+    let data_all_false = vec![false; N];
+    let col3 = Column {
+        dtype: DataType::Bool,
+        data: ColumnData::Bool(data_all_false.clone()),
+        validity: Some(val1.clone()),
+    };
+    let fast3 = bool_to_selection(&data_all_false, Some(&val1));
+    let generic3 = eval_predicate_generic(&col3);
+    assert_eq!(fast3, generic3, "Case 3 all false mismatch");
+    assert!(fast3.is_empty());
+
+    // Case 4: All true
+    let data_all_true = vec![true; N];
+    let val_all_valid = vec![true; N];
+    let col4 = Column {
+        dtype: DataType::Bool,
+        data: ColumnData::Bool(data_all_true.clone()),
+        validity: Some(val_all_valid.clone()),
+    };
+    let fast4 = bool_to_selection(&data_all_true, Some(&val_all_valid));
+    let generic4 = eval_predicate_generic(&col4);
+    assert_eq!(fast4, generic4, "Case 4 all true mismatch");
+    assert_eq!(fast4.len(), N);
+
+    // Case 5: Highly selective (~1% true)
+    let mut data_sparse = Vec::with_capacity(N);
+    for _ in 0..N {
+        data_sparse.push(rng.next_u64().is_multiple_of(100));
+    }
+    let col5 = Column {
+        dtype: DataType::Bool,
+        data: ColumnData::Bool(data_sparse.clone()),
+        validity: Some(val1.clone()),
+    };
+    let fast5 = bool_to_selection(&data_sparse, Some(&val1));
+    let generic5 = eval_predicate_generic(&col5);
+    assert_eq!(fast5, generic5, "Case 5 sparse mismatch");
+
+    // Case 6: Non-multiple of 64 length
+    let data_short = data1[0..137].to_vec();
+    let val_short = val1[0..137].to_vec();
+    let col6 = Column {
+        dtype: DataType::Bool,
+        data: ColumnData::Bool(data_short.clone()),
+        validity: Some(val_short.clone()),
+    };
+    let fast6 = bool_to_selection(&data_short, Some(&val_short));
+    let generic6 = eval_predicate_generic(&col6);
+    assert_eq!(fast6, generic6, "Case 6 non-multiple of 64 mismatch");
+}

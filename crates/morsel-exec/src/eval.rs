@@ -189,6 +189,16 @@ fn date32_to_year(days: i32) -> i64 {
 
 pub fn eval_predicate(expr: &Expr, batch: &Batch) -> Result<Vec<u32>> {
     let col = eval(expr, batch)?;
+    if let ColumnData::Bool(ref v) = col.data {
+        return Ok(crate::kernel::filter::bool_to_selection(
+            v,
+            col.validity.as_deref(),
+        ));
+    }
+    Ok(Vec::new())
+}
+
+pub fn eval_predicate_generic(col: &Column) -> Vec<u32> {
     let mut selected = Vec::new();
     if let ColumnData::Bool(ref v) = col.data {
         match &col.validity {
@@ -208,7 +218,7 @@ pub fn eval_predicate(expr: &Expr, batch: &Batch) -> Result<Vec<u32>> {
             }
         }
     }
-    Ok(selected)
+    selected
 }
 
 pub fn eval(expr: &Expr, batch: &Batch) -> Result<Column> {
