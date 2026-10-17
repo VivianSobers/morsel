@@ -19,7 +19,7 @@ Morsel is an in-memory, vectorized analytical SQL engine written in Rust. It loa
 
 ## Current Status
 
-All 22/22 TPC-H queries execute successfully and match reference answer sets at Scale Factor 1 (SF1) and Scale Factor 10 (SF10) (both scale factors verified at commit `b4532bd`; SF1 again at `118f9f3`).
+All 22/22 TPC-H queries execute successfully and match reference answer sets at Scale Factor 1 (SF1) and Scale Factor 10 (SF10) (both scale factors verified at commit `f7300f8`; SF1 again at `f6010a4`).
 
 ---
 
@@ -86,7 +86,7 @@ python bench/e2e.py --data /path/to/data/sf1 --refs bench/refs/sf1 --threads 16
 ## Benchmarks
 
 All four engines ran the 22 TPC-H queries in memory on one machine (i9-13900, 125 GB RAM, no other jobs), 16
-threads each, at commit `e56ad31`. Times exclude data loading; each value is the median of 5 timed runs after 1
+threads each, at commit `ac0cdc9`. Times exclude data loading; each value is the median of 5 timed runs after 1
 warm-up, and every answer passed the reference check (176 of 176).
 
 | Engine | SF1 total | SF1 geomean | SF10 total | SF10 geomean |

@@ -1,4 +1,4 @@
-bench commit e56ad31 threads 16 start 2026-10-17T04:44:52
+bench commit ac0cdc9 threads 16 start 2026-10-17T04:44:52
 gpu: 0 %, 95 MiB
  04:44:52 up 1 day,  8:43,  1 user,  load average: 11.44, 7.89, 4.96
 == morsel sf1 04:44:52 load 11.44 7.89 4.96

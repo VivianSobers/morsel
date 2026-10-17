@@ -1,6 +1,6 @@
 # Benchmark Results
 
-> **Note:** final: worker-2, no other jobs, threads 16, commit e56ad31
+> **Note:** final: worker-2, no other jobs, threads 16, commit ac0cdc9
 
 ## Environment
 
@@ -8,7 +8,7 @@
 - **RAM:** 125.5 GB
 - **Threads:** 16
 - **Engine Versions:**
-  - `morsel`: e56ad31
+  - `morsel`: ac0cdc9
   - `duckdb`: 1.4.5
   - `polars`: 1.34.0
   - `datafusion`: 55.0.0
@@ -41,3 +41,7 @@
 | **Q22** | 397.8 ms | 62.5 ms | 280.5 ms | 114.4 ms | 2.34 s | 234.8 ms | 2.54 s | 238.6 ms |
 | **Total** | **21.13 s** | **1.70 s** | **16.11 s** | **3.40 s** | **182.09 s** | **10.19 s** | **172.55 s** | **23.81 s** |
 | **Geomean** | **752.8 ms** | **64.5 ms** | **334.6 ms** | **141.7 ms** | **5.62 s** | **354.8 ms** | **3.34 s** | **876.9 ms** |
+
+> Commit hashes: the history was rewritten on 17 Oct 2026 to remove a machine-specific path string from a few
+> benchmark scripts. Hashes in these files were updated to the rewritten commits; the Rust sources at each commit
+> are byte-identical to what was built and run (`ac0cdc9` was `e56ad31` when the benchmark ran).

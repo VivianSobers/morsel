@@ -109,7 +109,7 @@ Queries: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
 | q20   | pass      |    1923.7 |  |
 | q21   | pass      |    2178.8 |  |
 | q22   | pass      |     747.0 |  |
-| Total | 22/22 pass |   27926.5 | sf=1, threads=16, commit=3f0b9ee |
+| Total | 22/22 pass |   27926.5 | sf=1, threads=16, commit=bc90437 |
 ```
 
 All 22 queries match their reference answer sets within established tolerances.
@@ -122,7 +122,7 @@ The differential fuzzer (`bench/fuzz.py`, `crates/morsel-fuzz`) generates pseudo
 
 ### Long Run (`fuzz2`)
 
-Executed against commit `2a28575` on 12 worker processes using SF0.1 parquet data (`/dev/shm/morsel/tpch/fuzz_sf01`):
+Executed against commit `5f61ef1` on 12 worker processes using SF0.1 parquet data (`/dev/shm/morsel/tpch/fuzz_sf01`):
 - **Results file**: `/dev/shm/morsel/fuzz2/results.jsonl`
 - **Total seeds recorded**: 519,198
 - **Pass**: 519,187
@@ -130,11 +130,11 @@ Executed against commit `2a28575` on 12 worker processes using SF0.1 parquet dat
 - **Morsel error**: 0
 - **DuckDB error**: 0
 
-All 11 reported mismatches were order mismatches on floating-point sort keys where the gap between adjacent keys equalled the checker's 0.01 tolerance window (for example, DuckDB emitted `9069.54` followed by `9069.55`, which the checker treated as indistinguishable under 0.01 tolerance). When evaluated using the tightened sort-key tolerance introduced in `493f832`, all 11 seeds pass without engine changes.
+All 11 reported mismatches were order mismatches on floating-point sort keys where the gap between adjacent keys equalled the checker's 0.01 tolerance window (for example, DuckDB emitted `9069.54` followed by `9069.55`, which the checker treated as indistinguishable under 0.01 tolerance). When evaluated using the tightened sort-key tolerance introduced in `42537d2`, all 11 seeds pass without engine changes.
 
 ### Initial Run (`f1`)
 
-Recorded in `~/morsel_status_f1.md` against commit `f6d24d7`:
+Recorded in `~/morsel_status_f1.md` against commit `bab82d1`:
 - **Total seeds**: 11,000
 - **Pass**: 10,999
 - **Mismatch**: 0
