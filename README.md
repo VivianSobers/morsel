@@ -85,4 +85,18 @@ python bench/e2e.py --data /path/to/data/sf1 --refs bench/refs/sf1 --threads 16
 
 ## Benchmarks
 
-Benchmark results against DuckDB, Polars and DataFusion will be added from recorded runs.
+All four engines ran the 22 TPC-H queries in memory on one machine (i9-13900, 125 GB RAM, no other jobs), 16
+threads each, at commit `e56ad31`. Times exclude data loading; each value is the median of 5 timed runs after 1
+warm-up, and every answer passed the reference check (176 of 176).
+
+| Engine | SF1 total | SF1 geomean | SF10 total | SF10 geomean |
+|:---|---:|---:|---:|---:|
+| DuckDB 1.4.5 | 1.70 s | 64.5 ms | 10.19 s | 354.8 ms |
+| DataFusion 55.0.0 | 3.40 s | 141.7 ms | 23.81 s | 876.9 ms |
+| Polars 1.34.0 | 16.11 s | 334.6 ms | 172.55 s | 3.34 s |
+| morsel | 21.13 s | 752.8 ms | 182.09 s | 5.62 s |
+
+morsel is about 12x slower than DuckDB at SF1 and 18x at SF10 on total time. Even Q6, a single scan, filter and
+sum, is 24x slower at SF1 (316 ms against 13 ms), which points at expression evaluation: it still goes row by row
+through a generic scalar type. That is the next thing to fix; no profile has confirmed it yet. Per-query numbers, the raw JSON Lines files and
+the exact command are in [bench/results/final](bench/results/final/README.md).
