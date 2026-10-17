@@ -300,6 +300,26 @@ pub fn eval(expr: &Expr, batch: &Batch) -> Result<Column> {
                     let left_col = eval(left, batch)?;
                     return eval_binary(*op, &left_col, &right_col, row_count);
                 }
+            } else if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) {
+                if let Expr::Literal(lit) = right.as_ref() {
+                    let left_col = eval(left, batch)?;
+                    if let Some(col) = crate::kernel::arithmetic::eval_arithmetic_col_lit_fast(
+                        *op, &left_col, lit,
+                    )? {
+                        return Ok(col);
+                    }
+                    let right_col = eval(right, batch)?;
+                    return eval_binary(*op, &left_col, &right_col, row_count);
+                } else if let Expr::Literal(lit) = left.as_ref() {
+                    let right_col = eval(right, batch)?;
+                    if let Some(col) = crate::kernel::arithmetic::eval_arithmetic_lit_col_fast(
+                        *op, lit, &right_col,
+                    )? {
+                        return Ok(col);
+                    }
+                    let left_col = eval(left, batch)?;
+                    return eval_binary(*op, &left_col, &right_col, row_count);
+                }
             }
             let left_col = eval(left, batch)?;
             let right_col = eval(right, batch)?;
@@ -928,6 +948,18 @@ fn scalar_to_f64(s: &Scalar) -> Result<f64> {
 }
 
 fn eval_arithmetic(op: BinOp, left: &Column, right: &Column, len: usize) -> Result<Column> {
+    if let Some(col) = crate::kernel::arithmetic::eval_arithmetic_col_col_fast(op, left, right)? {
+        return Ok(col);
+    }
+    eval_arithmetic_generic(op, left, right, len)
+}
+
+pub fn eval_arithmetic_generic(
+    op: BinOp,
+    left: &Column,
+    right: &Column,
+    len: usize,
+) -> Result<Column> {
     let mut scalars = Vec::with_capacity(len);
     for i in 0..len {
         if left.is_null(i) || right.is_null(i) {

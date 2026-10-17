@@ -77,6 +77,27 @@ fn make_lit_column(scalar: &Scalar, len: usize) -> Column {
     }
 }
 
+fn assert_columns_equal(col1: &Column, col2: &Column, msg: &str) {
+    assert_eq!(col1.dtype, col2.dtype, "{}: dtype mismatch", msg);
+    assert_eq!(col1.validity, col2.validity, "{}: validity mismatch", msg);
+    assert_eq!(col1.len(), col2.len(), "{}: length mismatch", msg);
+    for i in 0..col1.len() {
+        let s1 = col1.get(i);
+        let s2 = col2.get(i);
+        match (&s1, &s2) {
+            (Scalar::Float64(a), Scalar::Float64(b)) => {
+                if a.is_nan() && b.is_nan() {
+                    continue;
+                }
+                assert_eq!(a, b, "{}: mismatch at row {}", msg, i);
+            }
+            _ => {
+                assert_eq!(s1, s2, "{}: mismatch at row {}", msg, i);
+            }
+        }
+    }
+}
+
 #[test]
 fn test_comparison_fast_vs_generic() {
     const N: usize = 10_000;
@@ -366,6 +387,195 @@ fn test_comparison_fast_vs_generic() {
                 .expect("Utf8 col-lit fast path must be implemented");
             let generic_lit = eval_comparison_generic(op, &col1, &lit_col, N).unwrap();
             assert_eq!(fast_lit, generic_lit, "Utf8 col-lit mismatch for {:?}", op);
+        }
+    }
+}
+
+#[test]
+fn test_arithmetic_fast_vs_generic() {
+    use morsel_exec::eval::eval_arithmetic_generic;
+    use morsel_exec::kernel::arithmetic::{
+        eval_arithmetic_col_col_fast, eval_arithmetic_col_lit_fast,
+    };
+
+    const N: usize = 10_000;
+    let mut rng = SimpleRng::new(123);
+    let arith_ops = [BinOp::Add, BinOp::Sub, BinOp::Mul];
+
+    // 1. Int64
+    {
+        let mut v1 = Vec::with_capacity(N);
+        let mut v2 = Vec::with_capacity(N);
+        let mut val1 = Vec::with_capacity(N);
+        let mut val2 = Vec::with_capacity(N);
+        for _ in 0..N {
+            v1.push((rng.next_i64() % 100_000).abs());
+            v2.push((rng.next_i64() % 100_000).abs());
+            val1.push(rng.next_bool_null(15));
+            val2.push(rng.next_bool_null(15));
+        }
+        let col1 = Column {
+            dtype: DataType::Int64,
+            data: ColumnData::Int64(v1),
+            validity: Some(val1),
+        };
+        let col2 = Column {
+            dtype: DataType::Int64,
+            data: ColumnData::Int64(v2),
+            validity: Some(val2),
+        };
+        let lit = Scalar::Int64(500);
+        let lit_col = make_lit_column(&lit, N);
+
+        for &op in &arith_ops {
+            let fast_col = eval_arithmetic_col_col_fast(op, &col1, &col2)
+                .unwrap()
+                .expect("Int64 col-col arithmetic fast path must be implemented");
+            let generic_col = eval_arithmetic_generic(op, &col1, &col2, N).unwrap();
+            assert_eq!(fast_col, generic_col, "Int64 col-col mismatch for {:?}", op);
+
+            let fast_lit = eval_arithmetic_col_lit_fast(op, &col1, &lit)
+                .unwrap()
+                .expect("Int64 col-lit arithmetic fast path must be implemented");
+            let generic_lit = eval_arithmetic_generic(op, &col1, &lit_col, N).unwrap();
+            assert_eq!(fast_lit, generic_lit, "Int64 col-lit mismatch for {:?}", op);
+        }
+    }
+
+    // 2. Float64
+    {
+        let mut v1 = Vec::with_capacity(N);
+        let mut v2 = Vec::with_capacity(N);
+        let mut val1 = Vec::with_capacity(N);
+        let mut val2 = Vec::with_capacity(N);
+        for _ in 0..N {
+            v1.push((rng.next_f64()).abs());
+            v2.push((rng.next_f64()).abs() + 1.0);
+            val1.push(rng.next_bool_null(15));
+            val2.push(rng.next_bool_null(15));
+        }
+        let col1 = Column {
+            dtype: DataType::Float64,
+            data: ColumnData::Float64(v1),
+            validity: Some(val1),
+        };
+        let col2 = Column {
+            dtype: DataType::Float64,
+            data: ColumnData::Float64(v2),
+            validity: Some(val2),
+        };
+        let lit = Scalar::Float64(2.5);
+        let lit_col = make_lit_column(&lit, N);
+
+        for &op in &arith_ops {
+            let fast_col = eval_arithmetic_col_col_fast(op, &col1, &col2)
+                .unwrap()
+                .expect("Float64 col-col arithmetic fast path must be implemented");
+            let generic_col = eval_arithmetic_generic(op, &col1, &col2, N).unwrap();
+            assert_columns_equal(
+                &fast_col,
+                &generic_col,
+                &format!("Float64 col-col {:?}", op),
+            );
+
+            let fast_lit = eval_arithmetic_col_lit_fast(op, &col1, &lit)
+                .unwrap()
+                .expect("Float64 col-lit arithmetic fast path must be implemented");
+            let generic_lit = eval_arithmetic_generic(op, &col1, &lit_col, N).unwrap();
+            assert_columns_equal(
+                &fast_lit,
+                &generic_lit,
+                &format!("Float64 col-lit {:?}", op),
+            );
+        }
+    }
+
+    // 3. Decimal col vs col (equal scale and differing scale)
+    {
+        let dtype1 = DataType::Decimal {
+            precision: 38,
+            scale: 2,
+        };
+        let dtype2 = DataType::Decimal {
+            precision: 38,
+            scale: 2,
+        };
+        let mut v1 = Vec::with_capacity(N);
+        let mut v2 = Vec::with_capacity(N);
+        let mut val1 = Vec::with_capacity(N);
+        let mut val2 = Vec::with_capacity(N);
+        for _ in 0..N {
+            v1.push(((rng.next_i64() % 100_000).abs()) as i128);
+            v2.push(((rng.next_i64() % 100_000).abs()) as i128);
+            val1.push(rng.next_bool_null(15));
+            val2.push(rng.next_bool_null(15));
+        }
+        let col1 = Column {
+            dtype: dtype1,
+            data: ColumnData::Decimal(v1),
+            validity: Some(val1),
+        };
+        let col2 = Column {
+            dtype: dtype2,
+            data: ColumnData::Decimal(v2),
+            validity: Some(val2),
+        };
+        let lit_dec = Scalar::Decimal(1234, 2);
+        let lit_dec_col = make_lit_column(&lit_dec, N);
+
+        for &op in &arith_ops {
+            let fast_col = eval_arithmetic_col_col_fast(op, &col1, &col2)
+                .unwrap()
+                .expect("Decimal col-col arithmetic fast path must be implemented");
+            let generic_col = eval_arithmetic_generic(op, &col1, &col2, N).unwrap();
+            assert_eq!(
+                fast_col, generic_col,
+                "Decimal col-col mismatch for {:?}",
+                op
+            );
+
+            let fast_lit = eval_arithmetic_col_lit_fast(op, &col1, &lit_dec)
+                .unwrap()
+                .expect("Decimal col-lit arithmetic fast path must be implemented");
+            let generic_lit = eval_arithmetic_generic(op, &col1, &lit_dec_col, N).unwrap();
+            assert_eq!(
+                fast_lit, generic_lit,
+                "Decimal col-lit mismatch for {:?}",
+                op
+            );
+        }
+    }
+
+    // 4. Decimal or Int with literal
+    {
+        let dtype_dec = DataType::Decimal {
+            precision: 38,
+            scale: 2,
+        };
+        let mut v_dec = Vec::with_capacity(N);
+        let mut val_dec = Vec::with_capacity(N);
+        for _ in 0..N {
+            v_dec.push(((rng.next_i64() % 50_000).abs()) as i128);
+            val_dec.push(rng.next_bool_null(15));
+        }
+        let col_dec = Column {
+            dtype: dtype_dec,
+            data: ColumnData::Decimal(v_dec),
+            validity: Some(val_dec),
+        };
+        let lit_int = Scalar::Int32(5);
+        let lit_int_col = make_lit_column(&lit_int, N);
+
+        for &op in &arith_ops {
+            let fast_lit = eval_arithmetic_col_lit_fast(op, &col_dec, &lit_int)
+                .unwrap()
+                .expect("Decimal col with Int lit fast path must be implemented");
+            let generic_lit = eval_arithmetic_generic(op, &col_dec, &lit_int_col, N).unwrap();
+            assert_eq!(
+                fast_lit, generic_lit,
+                "Decimal with Int lit mismatch for {:?}",
+                op
+            );
         }
     }
 }
