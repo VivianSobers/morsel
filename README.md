@@ -83,6 +83,7 @@ python bench/e2e.py --data /path/to/data/sf1 --refs bench/refs/sf1 --threads 16
 
 ---
 
+
 ## Benchmarks
 
 All four engines ran the 22 TPC-H queries in memory on one machine (i9-13900, 125 GB RAM, no other jobs), 16
